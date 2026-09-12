@@ -47,7 +47,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // Системные кнопки встроенной IME nav bar, которые нужно скрыть.
     private static final Set<String> HIDDEN_NAV_BUTTON_IDS = new HashSet<>(Arrays.asList(
             "input_method_nav_back",
-            "input_method_nav_ime_switcher"
+            "input_method_nav_ime_switcher",
+            "input_method_nav_home_handle"
     ));
 
     @Override
@@ -208,7 +209,34 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
             );
         }
+
+        // --- Отладка: полный дамп всех view из пакета
+        //     android.inputmethodservice.navigationbar по мере их attach —
+        //     на случай, если останется что-то ещё не учтённое. ---
+        if (USE_NAVBAR_TREE_DUMP) {
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "onAttachedToWindow",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            String cls = v.getClass().getName();
+                            if (cls.startsWith("android.inputmethodservice.navigationbar")) {
+                                log("navbar-tree: class=" + cls
+                                        + " id=" + safeResName(v)
+                                        + " visibility=" + v.getVisibility()
+                                        + " cd=" + v.getContentDescription());
+                            }
+                        }
+                    }
+            );
+        }
     }
+
+    // Включи, если после скрытия известных ID всё ещё что-то видно —
+    // покажет полное дерево системной IME nav bar.
+    private static final boolean USE_NAVBAR_TREE_DUMP = true;
 
     // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
     private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
