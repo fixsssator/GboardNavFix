@@ -99,12 +99,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     // Переключи в true и пересобери, если нужен режим отладки для поиска
     // класса/значения вручную через logcat (adb logcat | grep GboardNavFix).
-    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
+    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = true;
 
     private void maybeZeroOut(XC_MethodHook.MethodHookParam param) {
         int resId = (int) param.args[0];
         Resources res = (Resources) param.thisObject;
         if (isTargetDimen(res, resId)) {
+            log("zeroing dimen, was=" + param.getResult());
             param.setResult(0);
         }
     }
