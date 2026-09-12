@@ -25,7 +25,14 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final String TAG = "GboardNavFix";
     private static final String GBOARD_PKG = "com.google.android.inputmethod.latin";
 
-    // Имена framework dimen-ресурсов, отвечающих за высоту nav bar.
+    // Найдено эмпирически через отладочное логирование setPadding:
+    // именно этот класс получает bottom=99 — корневой view клавиатуры.
+    private static final String TARGET_VIEW_CLASS =
+            "com.google.android.libraries.inputmethod.inputview.InputView";
+
+    // Имена framework dimen-ресурсов, отвечающих за высоту nav bar
+    // (оставлено на всякий случай — в тестах ни разу не сработало,
+    // Gboard в этой версии берёт значение не отсюда).
     private static final String[] TARGET_DIMEN_NAMES = {
             "navigation_bar_height",
             "navigation_bar_height_landscape",
@@ -41,7 +48,49 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
         log("hooking into Gboard, process=" + lpparam.processName);
 
-        // --- Основной хук: getDimensionPixelSize(int resId) ---
+        // --- Основной рабочий хук: обнуляем bottom-padding у InputView ---
+        XposedHelpers.findAndHookMethod(
+                View.class,
+                "setPadding",
+                int.class, int.class, int.class, int.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
+                            int bottom = (int) param.args[3];
+                            if (bottom > 0) {
+                                log("zeroing InputView bottom padding, was=" + bottom);
+                                param.args[3] = 0;
+                            }
+                        }
+                    }
+                }
+        );
+
+        // Некоторые View используют setPaddingRelative вместо setPadding —
+        // хукаем и его тем же способом на всякий случай.
+        XposedHelpers.findAndHookMethod(
+                View.class,
+                "setPaddingRelative",
+                int.class, int.class, int.class, int.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
+                            int bottom = (int) param.args[3];
+                            if (bottom > 0) {
+                                log("zeroing InputView bottom padding (relative), was=" + bottom);
+                                param.args[3] = 0;
+                            }
+                        }
+                    }
+                }
+        );
+
+        // --- Резервные хуки по имени ресурса (в тестах не срабатывали,
+        //     оставлены на случай других версий Gboard) ---
         XposedHelpers.findAndHookMethod(
                 Resources.class,
                 "getDimensionPixelSize",
@@ -54,7 +103,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // --- На всякий случай хукаем и getDimension(int resId) -> float ---
         XposedHelpers.findAndHookMethod(
                 Resources.class,
                 "getDimension",
@@ -71,12 +119,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // --- Фолбэк-хук (по умолчанию выключен, см. USE_VIEW_FALLBACK) ---
-        // Если после включения модуля полоса всё ещё видна — значит, Gboard
-        // в этой версии не читает системный dimen, а получает высоту
-        // через WindowInsets/setPadding напрямую. Раскомментируй блок ниже
-        // и включи флаг, чтобы логировать все setPadding с ненулевым низом —
-        // так можно быстро вычислить нужное значение эмпирически.
+        // --- Отладочное логирование (можно выключить, когда всё заработает) ---
         if (USE_VIEW_FALLBACK_DEBUG_LOGGING) {
             XposedHelpers.findAndHookMethod(
                     View.class,
@@ -99,7 +142,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     // Переключи в true и пересобери, если нужен режим отладки для поиска
     // класса/значения вручную через logcat (adb logcat | grep GboardNavFix).
-    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = true;
+    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
 
     private void maybeZeroOut(XC_MethodHook.MethodHookParam param) {
         int resId = (int) param.args[0];
