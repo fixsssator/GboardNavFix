@@ -174,6 +174,28 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
+        // --- Скрываем системные элементы, которые не ловятся через
+        //     setVisibility() (см. выше) — Android при первичной инфляции
+        //     XML применяет android:visibility напрямую во внутренние флаги
+        //     view, в обход публичного setVisibility(). Поэтому скрываем
+        //     явно здесь, как только view полностью создана и attached. ---
+        XposedHelpers.findAndHookMethod(
+                View.class,
+                "onAttachedToWindow",
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        String idName = safeResName(v);
+                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)
+                                && v.getVisibility() != View.GONE) {
+                            log("force-hiding on attach, id=" + idName);
+                            v.setVisibility(View.GONE);
+                        }
+                    }
+                }
+        );
+
         // --- Отладочное логирование (можно выключить, когда всё заработает) ---
         if (USE_VIEW_FALLBACK_DEBUG_LOGGING) {
             XposedHelpers.findAndHookMethod(
