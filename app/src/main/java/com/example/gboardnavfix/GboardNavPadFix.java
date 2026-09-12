@@ -3,6 +3,10 @@ package com.example.gboardnavfix;
 import android.content.res.Resources;
 import android.view.View;
 
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -39,6 +43,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             "navigation_bar_frame_height",
             "navigation_bar_width"
     };
+
+    // Системные кнопки встроенной IME nav bar, которые нужно скрыть.
+    private static final Set<String> HIDDEN_NAV_BUTTON_IDS = new HashSet<>(Arrays.asList(
+            "input_method_nav_back",
+            "input_method_nav_ime_switcher"
+    ));
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -119,6 +129,26 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
+        // --- Скрываем два конкретных системных элемента встроенной в IME-окно
+        //     навигационной панели: "стрелку назад" и "переключатель языка".
+        //     Найдены эмпирически через отладочное логирование ниже. ---
+        XposedHelpers.findAndHookMethod(
+                View.class,
+                "setOnClickListener",
+                View.OnClickListener.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        String idName = safeResName(v);
+                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)) {
+                            v.setVisibility(View.GONE);
+                            log("hid system IME nav button id=" + idName);
+                        }
+                    }
+                }
+        );
+
         // --- Отладочное логирование (можно выключить, когда всё заработает) ---
         if (USE_VIEW_FALLBACK_DEBUG_LOGGING) {
             XposedHelpers.findAndHookMethod(
@@ -181,7 +211,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     }
 
     // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
-    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = true;
+    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
 
     private String safeResName(View v) {
         try {
