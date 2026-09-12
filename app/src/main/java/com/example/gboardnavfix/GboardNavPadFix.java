@@ -130,9 +130,34 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // --- Скрываем два конкретных системных элемента встроенной в IME-окно
-        //     навигационной панели: "стрелку назад" и "переключатель языка".
-        //     Найдены эмпирически через отладочное логирование ниже. ---
+        // --- Скрываем системные элементы встроенной в IME-окно навигационной
+        //     панели: "стрелку назад", "переключатель языка", home-хэндл.
+        //     Хукаем setVisibility() напрямую (а не однократно при создании),
+        //     т.к. система периодически включает их обратно (например,
+        //     "Back" появляется/исчезает в зависимости от контекста). ---
+        XposedHelpers.findAndHookMethod(
+                View.class,
+                "setVisibility",
+                int.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        String idName = safeResName(v);
+                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)) {
+                            if ((int) param.args[0] != View.GONE) {
+                                log("forcing GONE on id=" + idName
+                                        + " (was requesting visibility=" + param.args[0] + ")");
+                                param.args[0] = View.GONE;
+                            }
+                        }
+                    }
+                }
+        );
+
+        // Подстраховка: скрываем и сразу при первом setOnClickListener
+        // (на случай если к этому моменту id уже назначен, а первый
+        // setVisibility мог случиться раньше, чем этот хук успел встать).
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setOnClickListener",
@@ -144,7 +169,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         String idName = safeResName(v);
                         if (HIDDEN_NAV_BUTTON_IDS.contains(idName)) {
                             v.setVisibility(View.GONE);
-                            log("hid system IME nav button id=" + idName);
                         }
                     }
                 }
