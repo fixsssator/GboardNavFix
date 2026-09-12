@@ -155,6 +155,26 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
+        // --- Блокируем сам клик по скрываемым кнопкам, независимо от того,
+        //     успела ли она уже стать GONE к моменту тапа (защита от гонки:
+        //     если пользователь тапнет в долю секунды до сокрытия — "Back"
+        //     всё равно не должен закрывать клавиатуру). ---
+        XposedHelpers.findAndHookMethod(
+                View.class,
+                "performClick",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        String idName = safeResName(v);
+                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)) {
+                            log("blocked click on id=" + idName);
+                            param.setResult(false);
+                        }
+                    }
+                }
+        );
+
         // Подстраховка: скрываем и сразу при первом setOnClickListener
         // (на случай если к этому моменту id уже назначен, а первый
         // setVisibility мог случиться раньше, чем этот хук успел встать).
@@ -191,6 +211,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 && v.getVisibility() != View.GONE) {
                             log("force-hiding on attach, id=" + idName);
                             v.setVisibility(View.GONE);
+                        }
+                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)) {
+                            v.setClickable(false);
+                            v.setFocusable(false);
                         }
                     }
                 }
