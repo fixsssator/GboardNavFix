@@ -138,6 +138,59 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
             );
         }
+
+        // --- Отладка для поиска кнопок нижнего тулбара (шеврон "свернуть",
+        //     переключатель языка) по contentDescription — она обычно не
+        //     обфусцирована, в отличие от имён ресурсов/классов. ---
+        if (USE_TOOLBAR_DEBUG_LOGGING) {
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "setContentDescription",
+                    CharSequence.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            CharSequence cd = (CharSequence) param.args[0];
+                            if (cd != null && cd.length() > 0) {
+                                View v = (View) param.thisObject;
+                                log("contentDescription=\"" + cd + "\" on "
+                                        + v.getClass().getName()
+                                        + " id=" + safeResName(v));
+                            }
+                        }
+                    }
+            );
+
+            // Некоторые кнопки не имеют contentDescription, но точно
+            // ImageView с drawable — логируем на всякий случай и их создание.
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "setOnClickListener",
+                    View.OnClickListener.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            log("setOnClickListener on " + v.getClass().getName()
+                                    + " id=" + safeResName(v)
+                                    + " cd=" + v.getContentDescription());
+                        }
+                    }
+            );
+        }
+    }
+
+    // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
+    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = true;
+
+    private String safeResName(View v) {
+        try {
+            int id = v.getId();
+            if (id == View.NO_ID) return "NO_ID";
+            return v.getResources().getResourceEntryName(id);
+        } catch (Exception e) {
+            return "?";
+        }
     }
 
     // Переключи в true и пересобери, если нужен режим отладки для поиска
