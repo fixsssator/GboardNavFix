@@ -2,13 +2,14 @@ package com.example.gboardnavfix;
 
 import android.content.Context;
 import android.content.res.Resources;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.inputmethodservice.InputMethodService;
-import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.widget.LinearLayout;
-import android.widget.TextView;
 
 import java.util.Arrays;
 import java.util.HashSet;
@@ -66,11 +67,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // что это реально язык — иначе рискуем спрятать что-то другое.
     private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
 
-    // Проверяем теорию про спуфинг версии вместо рисования своей кнопки.
-    private static final boolean SPOOF_VERSION_TO_DISABLE_EXPERIMENT = true;
-    // Пока проверяем теорию — самодельную кнопку не вставляем, чтобы не
-    // задваивалось. Если спуфинг не сработает, включим обратно.
-    private static final boolean ADD_CUSTOM_GLOBE_BUTTON = false;
+    // Спуфинг versionCode технически сработал (см. логи), но на UI не
+    // повлиял — значит эксперимент решается не через live-проверку версии,
+    // а раньше (кэш/снапшот). Оставляем код на будущее, но выключаем.
+    private static final boolean SPOOF_VERSION_TO_DISABLE_EXPERIMENT = false;
+    // Раз спуфинг не сработал — возвращаем самодельную кнопку.
+    private static final boolean ADD_CUSTOM_GLOBE_BUTTON = true;
 
     private static void tryHook(String className, ClassLoader cl, String methodName,
                                  XC_MethodHook hook, Object... paramTypes) {
@@ -493,6 +495,35 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
     private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
 
+    // Простая чёрно-белая иконка "глобус" (круг + меридиан + экватор),
+    // рисуется сама — без эмодзи (те всегда цветные) и без внешних ресурсов.
+    private static class GlobeIconView extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        GlobeIconView(Context ctx) {
+            super(ctx);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setColor(0xFFE8EAED); // светло-серый/белый, под тёмную тему
+            paint.setStrokeWidth(ctx.getResources().getDisplayMetrics().density * 1.3f);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            int w = getWidth();
+            int h = getHeight();
+            float size = Math.min(w, h) * 0.55f;
+            float cx = w / 2f;
+            float cy = h / 2f;
+            float r = size / 2f;
+            RectF circle = new RectF(cx - r, cy - r, cx + r, cy + r);
+            canvas.drawOval(circle, paint);
+            canvas.drawLine(cx - r, cy, cx + r, cy, paint);
+            RectF meridian = new RectF(cx - r * 0.45f, cy - r, cx + r * 0.45f, cy + r);
+            canvas.drawOval(meridian, paint);
+        }
+    }
+
     private void addLanguageSwitchButton(View spaceKey) {
         try {
             ViewParent parentObj = spaceKey.getParent();
@@ -503,26 +534,33 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             if (parent.findViewWithTag(GLOBE_TAG) != null) return;
 
             Context ctx = spaceKey.getContext();
-            TextView globe = new TextView(ctx);
+            GlobeIconView globe = new GlobeIconView(ctx);
             globe.setTag(GLOBE_TAG);
-            globe.setText("\uD83C\uDF10"); // 🌐
-            globe.setGravity(Gravity.CENTER);
-            float textSize = spaceKey.getHeight() > 0
-                    ? spaceKey.getHeight() / 2.5f
-                    : 22f;
-            globe.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, textSize);
             globe.setClickable(true);
             globe.setFocusable(true);
 
             ViewGroup.LayoutParams spaceParams = spaceKey.getLayoutParams();
             ViewGroup.LayoutParams newParams;
-            if (spaceParams instanceof LinearLayout.LayoutParams) {
+            LinearLayout.LayoutParams refLp = null;
+            for (int i = 0; i < parent.getChildCount(); i++) {
+                View child = parent.getChildAt(i);
+                if (LANGUAGE_KEY_ID.equals(safeResName(child))
+                        && child.getLayoutParams() instanceof LinearLayout.LayoutParams) {
+                    refLp = (LinearLayout.LayoutParams) child.getLayoutParams();
+                    break;
+                }
+            }
+            if (refLp != null) {
+                // Точная копия параметров реального соседнего слота
+                // (сейчас там эмодзи) — размер будет совпадать 1-в-1.
+                newParams = new LinearLayout.LayoutParams(refLp);
+            } else if (spaceParams instanceof LinearLayout.LayoutParams) {
                 LinearLayout.LayoutParams src = (LinearLayout.LayoutParams) spaceParams;
                 LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(src);
-                lp.weight = src.weight > 0 ? src.weight * 0.4f : 0;
-                if (lp.weight == 0) {
-                    lp.width = ViewGroup.LayoutParams.WRAP_CONTENT;
-                }
+                // Фиксированный небольшой вес — как у обычной клавиши,
+                // а НЕ доля от ширины пробела (иначе пробел заметно сузится).
+                lp.weight = 1f;
+                lp.width = 0;
                 newParams = lp;
             } else {
                 newParams = new ViewGroup.LayoutParams(
