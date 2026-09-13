@@ -512,7 +512,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             super.onDraw(canvas);
             int w = getWidth();
             int h = getHeight();
-            float size = Math.min(w, h) * 0.55f;
+            // Уменьшено с 0.55 — реальные иконки Gboard рисуются с большим
+            // запасом отступа вокруг, а не заливают всю область кнопки.
+            float size = Math.min(w, h) * 0.32f;
             float cx = w / 2f;
             float cy = h / 2f;
             float r = size / 2f;
@@ -522,6 +524,14 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             RectF meridian = new RectF(cx - r * 0.45f, cy - r, cx + r * 0.45f, cy + r);
             canvas.drawOval(meridian, paint);
         }
+    }
+
+    private View findChildById(ViewGroup parent, String idName) {
+        for (int i = 0; i < parent.getChildCount(); i++) {
+            View child = parent.getChildAt(i);
+            if (idName.equals(safeResName(child))) return child;
+        }
+        return null;
     }
 
     private void addLanguageSwitchButton(View spaceKey) {
@@ -541,15 +551,11 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
             ViewGroup.LayoutParams spaceParams = spaceKey.getLayoutParams();
             ViewGroup.LayoutParams newParams;
-            LinearLayout.LayoutParams refLp = null;
-            for (int i = 0; i < parent.getChildCount(); i++) {
-                View child = parent.getChildAt(i);
-                if (LANGUAGE_KEY_ID.equals(safeResName(child))
-                        && child.getLayoutParams() instanceof LinearLayout.LayoutParams) {
-                    refLp = (LinearLayout.LayoutParams) child.getLayoutParams();
-                    break;
-                }
-            }
+            View refChild = findChildById(parent, LANGUAGE_KEY_ID);
+            LinearLayout.LayoutParams refLp =
+                    (refChild != null && refChild.getLayoutParams() instanceof LinearLayout.LayoutParams)
+                            ? (LinearLayout.LayoutParams) refChild.getLayoutParams()
+                            : null;
             if (refLp != null) {
                 // Точная копия параметров реального соседнего слота
                 // (сейчас там эмодзи) — размер будет совпадать 1-в-1.
@@ -587,6 +593,18 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             int index = parent.indexOfChild(spaceKey);
             parent.addView(globe, Math.max(index, 0), newParams);
             log("inserted globe language-switch button next to space");
+
+            final View refForLog = findChildById(parent, LANGUAGE_KEY_ID);
+            globe.post(new Runnable() {
+                @Override
+                public void run() {
+                    log("globe size after layout: " + globe.getWidth() + "x" + globe.getHeight()
+                            + (refForLog != null
+                                    ? " | neighbor(" + LANGUAGE_KEY_ID + ") size: "
+                                            + refForLog.getWidth() + "x" + refForLog.getHeight()
+                                    : " | neighbor not found"));
+                }
+            });
         } catch (Throwable t) {
             log("failed to insert globe button: " + t);
         }
