@@ -66,6 +66,24 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // что это реально язык — иначе рискуем спрятать что-то другое.
     private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
 
+    // Проверяем теорию про спуфинг версии вместо рисования своей кнопки.
+    private static final boolean SPOOF_VERSION_TO_DISABLE_EXPERIMENT = true;
+    // Пока проверяем теорию — самодельную кнопку не вставляем, чтобы не
+    // задваивалось. Если спуфинг не сработает, включим обратно.
+    private static final boolean ADD_CUSTOM_GLOBE_BUTTON = false;
+
+    private static void tryHook(String className, ClassLoader cl, String methodName,
+                                 XC_MethodHook hook, Object... paramTypes) {
+        try {
+            Object[] args = Arrays.copyOf(paramTypes, paramTypes.length + 1);
+            args[paramTypes.length] = hook;
+            XposedHelpers.findAndHookMethod(className, cl, methodName, args);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": tryHook failed for " + methodName
+                    + Arrays.toString(paramTypes) + ": " + t);
+        }
+    }
+
     // Класс системного контейнера IME nav bar — зануляем ему высоту при
     // measure (не трогая visibility, чтобы не ломать попап языка).
     private static final String NAV_BAR_FRAME_CLASS =
@@ -101,6 +119,51 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         log("hooking into Gboard, process=" + lpparam.processName);
+
+        // --- ТЕОРИЯ: server-side experiment-флаги (Phenotype/GServices)
+        //     привязаны к конкретному versionCode/подписи APK. Когда юзер
+        //     пересобирает Gboard под другой версией — флаг "спрячь родную
+        //     кнопку языка, покажи вместо неё эмодзи" перестаёт совпадать,
+        //     и приложение откатывается на дефолтное поведение из кода —
+        //     с настоящей кнопкой языка. Подменяем versionCode/versionName
+        //     именно в тот момент, когда Gboard спрашивает PackageManager
+        //     САМ ПРО СЕБЯ (как это обычно делают перед запросом флагов). ---
+        if (SPOOF_VERSION_TO_DISABLE_EXPERIMENT) {
+            XC_MethodHook spoofHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        String pkg = (String) param.args[0];
+                        if (!GBOARD_PKG.equals(pkg)) return;
+                        Object info = param.getResult();
+                        if (info == null) return;
+                        XposedHelpers.setIntField(info, "versionCode", 999999);
+                        try {
+                            XposedHelpers.setLongField(info, "versionCodeMajor", 0L);
+                        } catch (Throwable ignored) {
+                            // поле есть не на всех версиях API — не критично
+                        }
+                        XposedHelpers.setObjectField(info, "versionName", "999.0.0-spoof");
+                        log("spoofed self versionCode/versionName for " + pkg);
+                    } catch (Throwable t) {
+                        log("version spoof failed: " + t);
+                    }
+                }
+            };
+            // Разные сигнатуры getPackageInfo на разных версиях Android —
+            // хукаем какие получится, остальные молча пропускаем.
+            tryHook("android.app.ApplicationPackageManager", lpparam.classLoader,
+                    "getPackageInfo", spoofHook, String.class, int.class);
+            try {
+                Class<?> flagsClass = Class.forName(
+                        "android.content.pm.PackageManager$PackageInfoFlags",
+                        false, lpparam.classLoader);
+                tryHook("android.app.ApplicationPackageManager", lpparam.classLoader,
+                        "getPackageInfo", spoofHook, String.class, flagsClass);
+            } catch (Throwable ignored) {
+                // API < 33, такого перегруза нет — и не надо
+            }
+        }
 
         // --- Запоминаем инстанс сервиса клавиатуры — понадобится, чтобы
         //     наша кнопка "глобус" могла вызвать переключение языка. ---
@@ -283,7 +346,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         // Слот языка занят эмодзи (серверный эксперимент
                         // Google прячет родную кнопку) — вставляем свою
                         // кнопку-глобус рядом с пробелом взамен.
-                        if ("key_pos_space".equals(idName)) {
+                        if (ADD_CUSTOM_GLOBE_BUTTON && "key_pos_space".equals(idName)) {
                             addLanguageSwitchButton(v);
                         }
                     }
