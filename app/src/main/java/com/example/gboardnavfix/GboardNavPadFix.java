@@ -44,12 +44,26 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             "navigation_bar_width"
     };
 
-    // Системные кнопки встроенной IME nav bar, которые нужно скрыть.
-    private static final Set<String> HIDDEN_NAV_BUTTON_IDS = new HashSet<>(Arrays.asList(
+    // Системные кнопки встроенной IME nav bar — скрываем безусловно,
+    // это framework-классы, они всегда одна и та же функция.
+    private static final Set<String> ALWAYS_HIDDEN_IDS = new HashSet<>(Arrays.asList(
             "input_method_nav_back",
             "input_method_nav_ime_switcher",
             "input_method_nav_home_handle"
     ));
+
+    // ВАЖНО: этот ID у Gboard переиспользуется под разные функции в
+    // зависимости от контекста поля ввода (иногда это переключатель
+    // языка, а иногда — например в поиске по вкладкам — эмодзи-кнопка).
+    // Поэтому скрываем его ТОЛЬКО когда contentDescription подтверждает,
+    // что это реально язык — иначе рискуем спрятать что-то другое.
+    private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
+
+    private static boolean isLanguageCd(CharSequence cd) {
+        if (cd == null) return false;
+        String s = cd.toString().toLowerCase();
+        return s.contains("language") || s.contains("язык");
+    }
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -144,12 +158,17 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
-                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)) {
+                        if (ALWAYS_HIDDEN_IDS.contains(idName)) {
                             if ((int) param.args[0] != View.GONE) {
                                 log("forcing GONE on id=" + idName
                                         + " (was requesting visibility=" + param.args[0] + ")");
                                 param.args[0] = View.GONE;
                             }
+                        } else if (LANGUAGE_KEY_ID.equals(idName)
+                                && isLanguageCd(v.getContentDescription())
+                                && (int) param.args[0] != View.GONE) {
+                            log("forcing GONE on language key (cd confirmed)");
+                            param.args[0] = View.GONE;
                         }
                     }
                 }
@@ -167,8 +186,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
-                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)) {
+                        if (ALWAYS_HIDDEN_IDS.contains(idName)) {
                             log("blocked click on id=" + idName);
+                            param.setResult(false);
+                        } else if (LANGUAGE_KEY_ID.equals(idName)
+                                && isLanguageCd(v.getContentDescription())) {
+                            log("blocked click on language key (cd confirmed)");
                             param.setResult(false);
                         }
                     }
@@ -187,7 +210,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void afterHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
-                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)) {
+                        if (ALWAYS_HIDDEN_IDS.contains(idName)) {
                             v.setVisibility(View.GONE);
                         }
                     }
@@ -207,14 +230,39 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void afterHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
-                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)
-                                && v.getVisibility() != View.GONE) {
-                            log("force-hiding on attach, id=" + idName);
-                            v.setVisibility(View.GONE);
-                        }
-                        if (HIDDEN_NAV_BUTTON_IDS.contains(idName)) {
+                        if (ALWAYS_HIDDEN_IDS.contains(idName)) {
+                            if (v.getVisibility() != View.GONE) {
+                                log("force-hiding on attach, id=" + idName);
+                                v.setVisibility(View.GONE);
+                            }
                             v.setClickable(false);
                             v.setFocusable(false);
+                        }
+                    }
+                }
+        );
+
+        // --- Решающая проверка для переиспользуемого слота
+        //     key_pos_switch_to_next_language: скрываем ТОЛЬКО когда
+        //     Gboard сам подтверждает через contentDescription, что в этой
+        //     позиции сейчас реально язык, а не эмодзи или что-то ещё. ---
+        XposedHelpers.findAndHookMethod(
+                View.class,
+                "setContentDescription",
+                CharSequence.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        String idName = safeResName(v);
+                        if (LANGUAGE_KEY_ID.equals(idName)) {
+                            CharSequence cd = (CharSequence) param.args[0];
+                            if (isLanguageCd(cd)) {
+                                log("hiding language key, cd=\"" + cd + "\"");
+                                v.setVisibility(View.GONE);
+                                v.setClickable(false);
+                                v.setFocusable(false);
+                            }
                         }
                     }
                 }
@@ -309,7 +357,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final boolean USE_NAVBAR_TREE_DUMP = true;
 
     // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
-    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = true;
+    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
 
     private String safeResName(View v) {
         try {
