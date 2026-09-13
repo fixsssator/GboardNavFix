@@ -59,17 +59,14 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // что это реально язык — иначе рискуем спрятать что-то другое.
     private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
 
-    // Сам контейнер системной IME nav bar. Скрывать только дочерние кнопки
-    // недостаточно: если у контейнера фиксированная высота (не wrap_content),
-    // он продолжает резервировать место, даже когда все дети внутри GONE.
-    // Поэтому прячем и сам контейнер целиком — по имени класса, т.к. у него
-    // нет android:id.
-    private static final String NAV_BAR_FRAME_CLASS =
-            "android.inputmethodservice.navigationbar.NavigationBarFrame";
-
+    // Сам контейнер системной IME nav bar. РАНЬШЕ мы прятали и его целиком
+    // (не только дочерние кнопки) — но это ломало попап выбора языка при
+    // долгом нажатии на пробел: попап позиционируется относительно этого
+    // контейнера, а наше периодическое принудительное GONE сбивало его
+    // измерение, и он тут же схлопывался. Поэтому теперь НЕ трогаем
+    // контейнер, только конкретные кнопки внутри него (см. ALWAYS_HIDDEN_IDS).
     private static boolean isAlwaysHidden(View v, String idName) {
-        return ALWAYS_HIDDEN_IDS.contains(idName)
-                || NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
+        return ALWAYS_HIDDEN_IDS.contains(idName);
     }
 
     private static boolean isLanguageCd(CharSequence cd) {
@@ -367,10 +364,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     // Включи, если после скрытия известных ID всё ещё что-то видно —
     // покажет полное дерево системной IME nav bar.
-    private static final boolean USE_NAVBAR_TREE_DUMP = true;
+    private static final boolean USE_NAVBAR_TREE_DUMP = false;
 
     // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
-    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = true;
+    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
 
     private String safeResName(View v) {
         try {
@@ -384,7 +381,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     // Переключи в true и пересобери, если нужен режим отладки для поиска
     // класса/значения вручную через logcat (adb logcat | grep GboardNavFix).
-    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = true;
+    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
 
     private void maybeZeroOut(XC_MethodHook.MethodHookParam param) {
         int resId = (int) param.args[0];
