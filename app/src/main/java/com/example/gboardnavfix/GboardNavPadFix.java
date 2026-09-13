@@ -309,7 +309,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final boolean USE_NAVBAR_TREE_DUMP = true;
 
     // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
-    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
+    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = true;
 
     private String safeResName(View v) {
         try {
