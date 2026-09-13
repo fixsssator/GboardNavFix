@@ -59,6 +59,19 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // что это реально язык — иначе рискуем спрятать что-то другое.
     private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
 
+    // Сам контейнер системной IME nav bar. Скрывать только дочерние кнопки
+    // недостаточно: если у контейнера фиксированная высота (не wrap_content),
+    // он продолжает резервировать место, даже когда все дети внутри GONE.
+    // Поэтому прячем и сам контейнер целиком — по имени класса, т.к. у него
+    // нет android:id.
+    private static final String NAV_BAR_FRAME_CLASS =
+            "android.inputmethodservice.navigationbar.NavigationBarFrame";
+
+    private static boolean isAlwaysHidden(View v, String idName) {
+        return ALWAYS_HIDDEN_IDS.contains(idName)
+                || NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
+    }
+
     private static boolean isLanguageCd(CharSequence cd) {
         if (cd == null) return false;
         String s = cd.toString().toLowerCase();
@@ -158,7 +171,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
-                        if (ALWAYS_HIDDEN_IDS.contains(idName)) {
+                        if (isAlwaysHidden(v, idName)) {
                             if ((int) param.args[0] != View.GONE) {
                                 log("forcing GONE on id=" + idName
                                         + " (was requesting visibility=" + param.args[0] + ")");
@@ -186,7 +199,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
-                        if (ALWAYS_HIDDEN_IDS.contains(idName)) {
+                        if (isAlwaysHidden(v, idName)) {
                             log("blocked click on id=" + idName);
                             param.setResult(false);
                         } else if (LANGUAGE_KEY_ID.equals(idName)
@@ -210,7 +223,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void afterHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
-                        if (ALWAYS_HIDDEN_IDS.contains(idName)) {
+                        if (isAlwaysHidden(v, idName)) {
                             v.setVisibility(View.GONE);
                         }
                     }
@@ -230,7 +243,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void afterHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
-                        if (ALWAYS_HIDDEN_IDS.contains(idName)) {
+                        if (isAlwaysHidden(v, idName)) {
                             if (v.getVisibility() != View.GONE) {
                                 log("force-hiding on attach, id=" + idName);
                                 v.setVisibility(View.GONE);
@@ -357,7 +370,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final boolean USE_NAVBAR_TREE_DUMP = true;
 
     // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
-    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
+    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = true;
 
     private String safeResName(View v) {
         try {
@@ -371,7 +384,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     // Переключи в true и пересобери, если нужен режим отладки для поиска
     // класса/значения вручную через logcat (adb logcat | grep GboardNavFix).
-    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
+    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = true;
 
     private void maybeZeroOut(XC_MethodHook.MethodHookParam param) {
         int resId = (int) param.args[0];
