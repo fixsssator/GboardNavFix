@@ -1,7 +1,14 @@
 package com.example.gboardnavfix;
 
+import android.content.Context;
 import android.content.res.Resources;
+import android.inputmethodservice.InputMethodService;
+import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewParent;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
 import java.util.Arrays;
 import java.util.HashSet;
@@ -59,6 +66,18 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // что это реально язык — иначе рискуем спрятать что-то другое.
     private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
 
+    // Класс системного контейнера IME nav bar — зануляем ему высоту при
+    // measure (не трогая visibility, чтобы не ломать попап языка).
+    private static final String NAV_BAR_FRAME_CLASS =
+            "android.inputmethodservice.navigationbar.NavigationBarFrame";
+
+    // Ссылка на запущенный сервис клавиатуры — нужна, чтобы наша кнопка
+    // "глобус" могла дёрнуть переключение языка тем же системным методом,
+    // которым обычно пользуется сама родная кнопка.
+    private static volatile InputMethodService sImeService;
+
+    private static final String GLOBE_TAG = "gboardnavfix_globe_button";
+
     // Сам контейнер системной IME nav bar. РАНЬШЕ мы прятали и его целиком
     // (не только дочерние кнопки) — но это ломало попап выбора языка при
     // долгом нажатии на пробел: попап позиционируется относительно этого
@@ -82,6 +101,19 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         log("hooking into Gboard, process=" + lpparam.processName);
+
+        // --- Запоминаем инстанс сервиса клавиатуры — понадобится, чтобы
+        //     наша кнопка "глобус" могла вызвать переключение языка. ---
+        XposedHelpers.findAndHookMethod(
+                InputMethodService.class,
+                "onCreate",
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        sImeService = (InputMethodService) param.thisObject;
+                    }
+                }
+        );
 
         // --- Основной рабочий хук: обнуляем bottom-padding у InputView ---
         XposedHelpers.findAndHookMethod(
@@ -248,6 +280,35 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             v.setClickable(false);
                             v.setFocusable(false);
                         }
+                        // Слот языка занят эмодзи (серверный эксперимент
+                        // Google прячет родную кнопку) — вставляем свою
+                        // кнопку-глобус рядом с пробелом взамен.
+                        if ("key_pos_space".equals(idName)) {
+                            addLanguageSwitchButton(v);
+                        }
+                    }
+                }
+        );
+
+        // --- Зануляем ВЫСОТУ контейнера системной nav bar при measure —
+        //     не трогая visibility (это и ломало попап языка раньше).
+        //     Контейнер продолжает существовать и measure-иться нормально
+        //     по ширине, но по высоте всегда получает 0. ---
+        XposedHelpers.findAndHookMethod(
+                NAV_BAR_FRAME_CLASS,
+                lpparam.classLoader,
+                "onMeasure",
+                int.class, int.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        try {
+                            int width = v.getMeasuredWidth();
+                            XposedHelpers.callMethod(v, "setMeasuredDimension", width, 0);
+                        } catch (Throwable t) {
+                            log("onMeasure override failed: " + t);
+                        }
                     }
                 }
         );
@@ -368,6 +429,67 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
     private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
+
+    private void addLanguageSwitchButton(View spaceKey) {
+        try {
+            ViewParent parentObj = spaceKey.getParent();
+            if (!(parentObj instanceof ViewGroup)) return;
+            ViewGroup parent = (ViewGroup) parentObj;
+
+            // Уже вставляли в этот ряд — не дублируем.
+            if (parent.findViewWithTag(GLOBE_TAG) != null) return;
+
+            Context ctx = spaceKey.getContext();
+            TextView globe = new TextView(ctx);
+            globe.setTag(GLOBE_TAG);
+            globe.setText("\uD83C\uDF10"); // 🌐
+            globe.setGravity(Gravity.CENTER);
+            float textSize = spaceKey.getHeight() > 0
+                    ? spaceKey.getHeight() / 2.5f
+                    : 22f;
+            globe.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, textSize);
+            globe.setClickable(true);
+            globe.setFocusable(true);
+
+            ViewGroup.LayoutParams spaceParams = spaceKey.getLayoutParams();
+            ViewGroup.LayoutParams newParams;
+            if (spaceParams instanceof LinearLayout.LayoutParams) {
+                LinearLayout.LayoutParams src = (LinearLayout.LayoutParams) spaceParams;
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(src);
+                lp.weight = src.weight > 0 ? src.weight * 0.4f : 0;
+                if (lp.weight == 0) {
+                    lp.width = ViewGroup.LayoutParams.WRAP_CONTENT;
+                }
+                newParams = lp;
+            } else {
+                newParams = new ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT);
+            }
+
+            globe.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    InputMethodService svc = sImeService;
+                    if (svc != null) {
+                        try {
+                            svc.switchToNextInputMethod(false);
+                        } catch (Throwable t) {
+                            log("switchToNextInputMethod failed: " + t);
+                        }
+                    } else {
+                        log("no ime service reference yet, cannot switch language");
+                    }
+                }
+            });
+
+            int index = parent.indexOfChild(spaceKey);
+            parent.addView(globe, Math.max(index, 0), newParams);
+            log("inserted globe language-switch button next to space");
+        } catch (Throwable t) {
+            log("failed to insert globe button: " + t);
+        }
+    }
 
     private String safeResName(View v) {
         try {
