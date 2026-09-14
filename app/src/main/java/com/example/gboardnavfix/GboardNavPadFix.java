@@ -64,11 +64,22 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
 
     // Спуфинг versionCode технически сработал (см. логи), но на UI не
-    // повлиял — значит эксперимент решается не через live-проверку версии,
-    // а раньше (кэш/снапшот). Оставляем код на будущее, но выключаем.
-    private static final boolean SPOOF_VERSION_TO_DISABLE_EXPERIMENT = false;
-    // Раз спуфинг не сработал — возвращаем самодельную кнопку.
-    private static final boolean ADD_CUSTOM_GLOBE_BUTTON = true;
+    // повлиял. НОВАЯ ТЕОРИЯ (после сравнения твоего пересобранного APK
+    // с оригиналом): у пересобранного APK ОБЯЗАТЕЛЬНО меняется ещё и
+    // подпись (apktool не умеет сохранять оригинальную подпись Google) —
+    // возможно, эксперимент завязан именно на подпись, а не на версию.
+    // Пробуем теперь спуфить и её тоже.
+    private static final boolean SPOOF_VERSION_TO_DISABLE_EXPERIMENT = true;
+    // Репёрпоз эмодзи-кнопки в языковую НЕ РАБОТАЕТ:
+    // - иконка через рефлексию попадает не в то Drawable-поле (визуально
+    //   "размазывает" кнопку — у SoftKeyView несколько полей-дровяшек:
+    //   фон, ripple, сама иконка, и рефлексия хватает первое попавшееся);
+    // - клик всё равно открывает эмодзи, а не переключает язык — Gboard
+    //   обрабатывает нажатия клавиш НЕ через стандартный OnClickListener/
+    //   performClick, а через свой внутренний touch-механизм, так что
+    //   наша подмена клика не перехватывает реальное действие.
+    // Оставлено выключенным, пока не найден настоящий путь перехвата клика.
+    private static final boolean ADD_CUSTOM_GLOBE_BUTTON = false;
 
     private static void tryHook(String className, ClassLoader cl, String methodName,
                                  XC_MethodHook hook, Object... paramTypes) {
@@ -145,7 +156,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             // поле есть не на всех версиях API — не критично
                         }
                         XposedHelpers.setObjectField(info, "versionName", "999.0.0-spoof");
-                        log("spoofed self versionCode/versionName for " + pkg);
+
+                        // Подмена подписи — имитируем то, что реально происходит
+                        // при пересборке apktool'ом (сертификат меняется на
+                        // отличный от настоящего Google-ключа).
+                        spoofSignatureFields(info);
+
+                        log("spoofed self versionCode/versionName/signature for " + pkg);
                     } catch (Throwable t) {
                         log("version spoof failed: " + t);
                     }
@@ -166,7 +183,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             }
         }
 
-        // --- Запоминаем инстанс сервиса клавиатуры — понадобится, чтобы
+    // --- Запоминаем инстанс сервиса клавиатуры — понадобится, чтобы
         //     наша кнопка "глобус" могла вызвать переключение языка. ---
         XposedHelpers.findAndHookMethod(
                 InputMethodService.class,
@@ -506,6 +523,58 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         }
                     }
             );
+        }
+    }
+
+    private void spoofSignatureFields(Object packageInfo) {
+        try {
+            android.content.pm.Signature dummy = new android.content.pm.Signature(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            );
+            // Старое поле (pre-API28) — прямой массив подписей на PackageInfo.
+            try {
+                XposedHelpers.setObjectField(packageInfo, "signatures",
+                        new android.content.pm.Signature[]{dummy});
+            } catch (Throwable ignored) {
+            }
+            // Новое поле (API 28+) — PackageInfo.signingInfo оборачивает
+            // SigningDetails/SigningInfo с подписями внутри. Структура
+            // менялась между версиями Android, поэтому патчим рекурсивно
+            // любые поля типа Signature/Signature[] на глубину до 3 уровней.
+            try {
+                Object signingInfo = XposedHelpers.getObjectField(packageInfo, "signingInfo");
+                patchSignaturesRecursively(signingInfo, dummy, 3);
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable t) {
+            log("spoofSignatureFields failed: " + t);
+        }
+    }
+
+    private void patchSignaturesRecursively(Object obj, android.content.pm.Signature dummy, int depth) {
+        if (obj == null || depth < 0) return;
+        Class<?> cls = obj.getClass();
+        while (cls != null && cls != Object.class) {
+            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                try {
+                    f.setAccessible(true);
+                    Class<?> ft = f.getType();
+                    if (ft == android.content.pm.Signature[].class) {
+                        f.set(obj, new android.content.pm.Signature[]{dummy});
+                    } else if (ft == android.content.pm.Signature.class) {
+                        f.set(obj, dummy);
+                    } else if (!ft.isPrimitive() && ft.getName().startsWith("android.content.pm.")) {
+                        Object nested = f.get(obj);
+                        if (nested != null) {
+                            patchSignaturesRecursively(nested, dummy, depth - 1);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                    // пробуем следующее поле
+                }
+            }
+            cls = cls.getSuperclass();
         }
     }
 
