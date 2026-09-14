@@ -1,17 +1,11 @@
 package com.example.gboardnavfix;
 
-import android.content.Context;
 import android.content.res.Resources;
-import android.graphics.Canvas;
-import android.graphics.Paint;
-import android.graphics.RectF;
 import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.ViewParent;
 import android.widget.ImageView;
-import android.widget.LinearLayout;
 
 import java.util.Arrays;
 import java.util.HashSet;
@@ -98,8 +92,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // "глобус" могла дёрнуть переключение языка тем же системным методом,
     // которым обычно пользуется сама родная кнопка.
     private static volatile InputMethodService sImeService;
-
-    private static final String GLOBE_TAG = "gboardnavfix_globe_button";
 
     // Настоящая иконка системной кнопки "Switch input method" — перехватываем
     // её Drawable до того, как прячем саму кнопку, и переиспользуем в своей.
@@ -381,12 +373,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             v.setClickable(false);
                             v.setFocusable(false);
                         }
-                        // Слот языка занят эмодзи (серверный эксперимент
-                        // Google прячет родную кнопку) — вставляем свою
-                        // кнопку-глобус рядом с пробелом взамен.
-                        if (ADD_CUSTOM_GLOBE_BUTTON && "key_pos_space".equals(idName)) {
-                            addLanguageSwitchButton(v);
-                        }
+                        // Вставка отдельной 7-й кнопки больше не используется —
+                        // сдвигала раскладку (см. repurposeAsLanguageKey выше,
+                        // вызывается из хука setContentDescription).
                         // Зануляем высоту контейнера системной nav bar через
                         // LayoutParams (не через onMeasure — та версия класса
                         // не переопределяет onMeasure сама, хук по точной
@@ -407,7 +396,11 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         // --- Решающая проверка для переиспользуемого слота
         //     key_pos_switch_to_next_language: скрываем ТОЛЬКО когда
         //     Gboard сам подтверждает через contentDescription, что в этой
-        //     позиции сейчас реально язык, а не эмодзи или что-то ещё. ---
+        //     позиции сейчас реально язык, а не эмодзи или что-то ещё.
+        //     Если там НЕ язык (сейчас — эмодзи) — вместо добавления новой
+        //     7-й кнопки (что сдвигало раскладку) ПЕРЕИСПОЛЬЗУЕМ эту же
+        //     кнопку: подменяем иконку на языковую и клик — на переключение
+        //     языка. Раскладка не трогается вообще. ---
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setContentDescription",
@@ -424,6 +417,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 v.setVisibility(View.GONE);
                                 v.setClickable(false);
                                 v.setFocusable(false);
+                            } else if (ADD_CUSTOM_GLOBE_BUTTON) {
+                                repurposeAsLanguageKey(v, cd);
                             }
                         }
                     }
@@ -521,139 +516,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
     private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
 
-    // Простая чёрно-белая иконка "глобус" (круг + меридиан + экватор),
-    // рисуется сама — без эмодзи (те всегда цветные) и без внешних ресурсов.
-    private static class GlobeIconView extends View {
-        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-
-        GlobeIconView(Context ctx) {
-            super(ctx);
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setColor(0xFFE8EAED); // светло-серый/белый, под тёмную тему
-            paint.setStrokeWidth(ctx.getResources().getDisplayMetrics().density * 1.3f);
-        }
-
-        @Override
-        protected void onDraw(Canvas canvas) {
-            super.onDraw(canvas);
-            int w = getWidth();
-            int h = getHeight();
-            // Уменьшено с 0.55 — реальные иконки Gboard рисуются с большим
-            // запасом отступа вокруг, а не заливают всю область кнопки.
-            float size = Math.min(w, h) * 0.32f;
-            float cx = w / 2f;
-            float cy = h / 2f;
-            float r = size / 2f;
-            RectF circle = new RectF(cx - r, cy - r, cx + r, cy + r);
-            canvas.drawOval(circle, paint);
-            canvas.drawLine(cx - r, cy, cx + r, cy, paint);
-            RectF meridian = new RectF(cx - r * 0.45f, cy - r, cx + r * 0.45f, cy + r);
-            canvas.drawOval(meridian, paint);
-        }
-    }
-
-    private View findChildById(ViewGroup parent, String idName) {
-        for (int i = 0; i < parent.getChildCount(); i++) {
-            View child = parent.getChildAt(i);
-            if (idName.equals(safeResName(child))) return child;
-        }
-        return null;
-    }
-
-    private void addLanguageSwitchButton(View spaceKey) {
-        try {
-            ViewParent parentObj = spaceKey.getParent();
-            if (!(parentObj instanceof ViewGroup)) return;
-            ViewGroup parent = (ViewGroup) parentObj;
-
-            // Уже вставляли в этот ряд — не дублируем.
-            if (parent.findViewWithTag(GLOBE_TAG) != null) return;
-
-            Context ctx = spaceKey.getContext();
-            View globe;
-            if (sLanguageIconDrawable != null) {
-                // Настоящая иконка Google — предпочтительный вариант.
-                ImageView iv = new ImageView(ctx);
-                try {
-                    iv.setImageDrawable(sLanguageIconDrawable.getConstantState() != null
-                            ? sLanguageIconDrawable.getConstantState().newDrawable().mutate()
-                            : sLanguageIconDrawable);
-                } catch (Throwable t) {
-                    iv.setImageDrawable(sLanguageIconDrawable);
-                }
-                iv.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
-                int pad = (int) (ctx.getResources().getDisplayMetrics().density * 12);
-                iv.setPadding(pad, pad, pad, pad);
-                globe = iv;
-            } else {
-                // Запасной вариант — своя нарисованная иконка, если
-                // настоящую перехватить не удалось.
-                globe = new GlobeIconView(ctx);
-            }
-            globe.setTag(GLOBE_TAG);
-            globe.setClickable(true);
-            globe.setFocusable(true);
-
-            ViewGroup.LayoutParams spaceParams = spaceKey.getLayoutParams();
-            ViewGroup.LayoutParams newParams;
-            View refChild = findChildById(parent, LANGUAGE_KEY_ID);
-            LinearLayout.LayoutParams refLp =
-                    (refChild != null && refChild.getLayoutParams() instanceof LinearLayout.LayoutParams)
-                            ? (LinearLayout.LayoutParams) refChild.getLayoutParams()
-                            : null;
-            if (refLp != null) {
-                // Точная копия параметров реального соседнего слота
-                // (сейчас там эмодзи) — размер будет совпадать 1-в-1.
-                newParams = new LinearLayout.LayoutParams(refLp);
-            } else if (spaceParams instanceof LinearLayout.LayoutParams) {
-                LinearLayout.LayoutParams src = (LinearLayout.LayoutParams) spaceParams;
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(src);
-                // Фиксированный небольшой вес — как у обычной клавиши,
-                // а НЕ доля от ширины пробела (иначе пробел заметно сузится).
-                lp.weight = 1f;
-                lp.width = 0;
-                newParams = lp;
-            } else {
-                newParams = new ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT);
-            }
-
-            globe.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View view) {
-                    InputMethodService svc = sImeService;
-                    if (svc != null) {
-                        try {
-                            svc.switchToNextInputMethod(false);
-                        } catch (Throwable t) {
-                            log("switchToNextInputMethod failed: " + t);
-                        }
-                    } else {
-                        log("no ime service reference yet, cannot switch language");
-                    }
-                }
-            });
-
-            int index = parent.indexOfChild(spaceKey);
-            parent.addView(globe, Math.max(index, 0), newParams);
-            log("inserted globe language-switch button next to space");
-
-            final View refForLog = findChildById(parent, LANGUAGE_KEY_ID);
-            globe.post(new Runnable() {
-                @Override
-                public void run() {
-                    log("globe size after layout: " + globe.getWidth() + "x" + globe.getHeight()
-                            + (refForLog != null
-                                    ? " | neighbor(" + LANGUAGE_KEY_ID + ") size: "
-                                            + refForLog.getWidth() + "x" + refForLog.getHeight()
-                                    : " | neighbor not found"));
-                }
-            });
-        } catch (Throwable t) {
-            log("failed to insert globe button: " + t);
-        }
-    }
 
     private String safeResName(View v) {
         try {
@@ -663,6 +525,76 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         } catch (Exception e) {
             return "?";
         }
+    }
+
+    private static final String REPURPOSED_TAG = "gboardnavfix_repurposed";
+
+    private void repurposeAsLanguageKey(View v, CharSequence originalCd) {
+        try {
+            if (REPURPOSED_TAG.equals(v.getTag())) return; // уже сделали
+            if (sLanguageIconDrawable == null) return; // иконку ещё не перехватили
+
+            boolean iconSet = false;
+            if (v instanceof ImageView) {
+                try {
+                    Drawable fresh = sLanguageIconDrawable.getConstantState() != null
+                            ? sLanguageIconDrawable.getConstantState().newDrawable().mutate()
+                            : sLanguageIconDrawable;
+                    ((ImageView) v).setImageDrawable(fresh);
+                    iconSet = true;
+                } catch (Throwable t) {
+                    log("repurpose: setImageDrawable failed: " + t);
+                }
+            } else {
+                // SoftKeyView — не ImageView, ищем поле типа Drawable
+                // рефлексией и подменяем его напрямую.
+                iconSet = trySetDrawableField(v);
+            }
+
+            v.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    InputMethodService svc = sImeService;
+                    if (svc != null) {
+                        try {
+                            svc.switchToNextInputMethod(false);
+                        } catch (Throwable t) {
+                            log("switchToNextInputMethod failed: " + t);
+                        }
+                    }
+                }
+            });
+            v.setTag(REPURPOSED_TAG);
+            log("repurposed emoji-slot key as language switch, iconSet=" + iconSet
+                    + " class=" + v.getClass().getName() + " originalCd=\"" + originalCd + "\"");
+        } catch (Throwable t) {
+            log("repurposeAsLanguageKey failed: " + t);
+        }
+    }
+
+    private boolean trySetDrawableField(View v) {
+        Class<?> cls = v.getClass();
+        while (cls != null && cls != Object.class) {
+            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                if (Drawable.class.isAssignableFrom(f.getType())) {
+                    try {
+                        f.setAccessible(true);
+                        Drawable fresh = sLanguageIconDrawable.getConstantState() != null
+                                ? sLanguageIconDrawable.getConstantState().newDrawable().mutate()
+                                : sLanguageIconDrawable;
+                        f.set(v, fresh);
+                        v.invalidate();
+                        log("repurpose: set drawable field '" + f.getName()
+                                + "' on " + cls.getName());
+                        return true;
+                    } catch (Throwable ignored) {
+                        // пробуем следующее поле
+                    }
+                }
+            }
+            cls = cls.getSuperclass();
+        }
+        return false;
     }
 
     // Переключи в true и пересобери, если нужен режим отладки для поиска
