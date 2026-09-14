@@ -5,10 +5,12 @@ import android.content.res.Resources;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.RectF;
+import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 
 import java.util.Arrays;
@@ -86,8 +88,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
     }
 
-    // Класс системного контейнера IME nav bar — зануляем ему высоту при
-    // measure (не трогая visibility, чтобы не ломать попап языка).
+    // Класс системного контейнера IME nav bar — зануляем ему высоту через
+    // LayoutParams при attach (не через onMeasure — тот хук падал с
+    // NoSuchMethodError, класс не переопределяет onMeasure сам).
     private static final String NAV_BAR_FRAME_CLASS =
             "android.inputmethodservice.navigationbar.NavigationBarFrame";
 
@@ -97,6 +100,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static volatile InputMethodService sImeService;
 
     private static final String GLOBE_TAG = "gboardnavfix_globe_button";
+
+    // Настоящая иконка системной кнопки "Switch input method" — перехватываем
+    // её Drawable до того, как прячем саму кнопку, и переиспользуем в своей.
+    private static volatile Drawable sLanguageIconDrawable;
 
     // Сам контейнер системной IME nav bar. РАНЬШЕ мы прятали и его целиком
     // (не только дочерние кнопки) — но это ломало попап выбора языка при
@@ -178,6 +185,35 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         sImeService = (InputMethodService) param.thisObject;
                     }
                 }
+        );
+
+        // --- Перехватываем НАСТОЯЩУЮ иконку системной кнопки языка ДО того,
+        //     как мы её прячем — и переиспользуем в своей кнопке вместо
+        //     самодельного рисунка. ---
+        tryHook(
+                "android.inputmethodservice.navigationbar.KeyButtonView",
+                lpparam.classLoader,
+                "setImageDrawable", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        if ("input_method_nav_ime_switcher".equals(safeResName(v))) {
+                            Drawable d = (Drawable) param.args[0];
+                            if (d != null && sLanguageIconDrawable == null) {
+                                try {
+                                    Drawable fresh = d.getConstantState() != null
+                                            ? d.getConstantState().newDrawable().mutate()
+                                            : d;
+                                    sLanguageIconDrawable = fresh;
+                                    log("captured real language icon drawable");
+                                } catch (Throwable t) {
+                                    log("failed to capture icon drawable: " + t);
+                                }
+                            }
+                        }
+                    }
+                },
+                Drawable.class
         );
 
         // --- Основной рабочий хук: обнуляем bottom-padding у InputView ---
@@ -351,28 +387,18 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         if (ADD_CUSTOM_GLOBE_BUTTON && "key_pos_space".equals(idName)) {
                             addLanguageSwitchButton(v);
                         }
-                    }
-                }
-        );
-
-        // --- Зануляем ВЫСОТУ контейнера системной nav bar при measure —
-        //     не трогая visibility (это и ломало попап языка раньше).
-        //     Контейнер продолжает существовать и measure-иться нормально
-        //     по ширине, но по высоте всегда получает 0. ---
-        XposedHelpers.findAndHookMethod(
-                NAV_BAR_FRAME_CLASS,
-                lpparam.classLoader,
-                "onMeasure",
-                int.class, int.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        View v = (View) param.thisObject;
-                        try {
-                            int width = v.getMeasuredWidth();
-                            XposedHelpers.callMethod(v, "setMeasuredDimension", width, 0);
-                        } catch (Throwable t) {
-                            log("onMeasure override failed: " + t);
+                        // Зануляем высоту контейнера системной nav bar через
+                        // LayoutParams (не через onMeasure — та версия класса
+                        // не переопределяет onMeasure сама, хук по точной
+                        // сигнатуре падал с NoSuchMethodError). Visibility
+                        // не трогаем — это ломало попап языка ранее.
+                        if (NAV_BAR_FRAME_CLASS.equals(v.getClass().getName())) {
+                            ViewGroup.LayoutParams lp = v.getLayoutParams();
+                            if (lp != null && lp.height != 0) {
+                                lp.height = 0;
+                                v.setLayoutParams(lp);
+                                log("zeroed NavigationBarFrame height via LayoutParams");
+                            }
                         }
                     }
                 }
@@ -544,7 +570,26 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             if (parent.findViewWithTag(GLOBE_TAG) != null) return;
 
             Context ctx = spaceKey.getContext();
-            GlobeIconView globe = new GlobeIconView(ctx);
+            View globe;
+            if (sLanguageIconDrawable != null) {
+                // Настоящая иконка Google — предпочтительный вариант.
+                ImageView iv = new ImageView(ctx);
+                try {
+                    iv.setImageDrawable(sLanguageIconDrawable.getConstantState() != null
+                            ? sLanguageIconDrawable.getConstantState().newDrawable().mutate()
+                            : sLanguageIconDrawable);
+                } catch (Throwable t) {
+                    iv.setImageDrawable(sLanguageIconDrawable);
+                }
+                iv.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+                int pad = (int) (ctx.getResources().getDisplayMetrics().density * 12);
+                iv.setPadding(pad, pad, pad, pad);
+                globe = iv;
+            } else {
+                // Запасной вариант — своя нарисованная иконка, если
+                // настоящую перехватить не удалось.
+                globe = new GlobeIconView(ctx);
+            }
             globe.setTag(GLOBE_TAG);
             globe.setClickable(true);
             globe.setFocusable(true);
