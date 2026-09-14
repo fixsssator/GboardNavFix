@@ -132,6 +132,15 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
         log("hooking into Gboard, process=" + lpparam.processName);
 
+        // --- Наш спуфинг подписи (ниже) ломает ДРУГУЮ, отдельную внутреннюю
+        //     проверку Gboard — сверку подписи установленных сплитов/модулей
+        //     с "своей" подписью. Она кидает необработанный IllegalStateException
+        //     на фоновом потоке пула, который валит весь процесс. Не убираем
+        //     сам спуфинг (он и даёт нужный эффект — настоящую кнопку языка),
+        //     а глушим именно это конкретное исключение, чтобы оно не убивало
+        //     приложение целиком. ---
+        installCrashGuard();
+
         // --- ТЕОРИЯ: server-side experiment-флаги (Phenotype/GServices)
         //     привязаны к конкретному versionCode/подписи APK. Когда юзер
         //     пересобирает Gboard под другой версией — флаг "спрячь родную
@@ -531,6 +540,48 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
             );
         }
+    }
+
+    private void installCrashGuard() {
+        try {
+            final Thread.UncaughtExceptionHandler original =
+                    Thread.getDefaultUncaughtExceptionHandler();
+            Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+                @Override
+                public void uncaughtException(Thread t, Throwable e) {
+                    if (isSelfInflictedSignatureCrash(e)) {
+                        log("suppressed self-inflicted signature-check crash on thread "
+                                + t.getName() + ": " + e);
+                        return; // глушим — не даём убить процесс
+                    }
+                    if (original != null) {
+                        original.uncaughtException(t, e);
+                    } else {
+                        // на всякий случай — иначе поток просто зависнет,
+                        // а не завершится штатно
+                        System.exit(1);
+                    }
+                }
+            });
+            log("installed crash guard for self-inflicted signature check");
+        } catch (Throwable t) {
+            log("installCrashGuard failed: " + t);
+        }
+    }
+
+    private boolean isSelfInflictedSignatureCrash(Throwable e) {
+        Throwable cur = e;
+        int depth = 0;
+        while (cur != null && depth < 5) {
+            if (cur instanceof IllegalStateException
+                    && cur.getMessage() != null
+                    && cur.getMessage().contains("signed by unrecognized certificates")) {
+                return true;
+            }
+            cur = cur.getCause();
+            depth++;
+        }
+        return false;
     }
 
     private void spoofSignatureFields(Object packageInfo) {
