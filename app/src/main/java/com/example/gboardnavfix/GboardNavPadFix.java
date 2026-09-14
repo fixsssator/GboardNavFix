@@ -429,11 +429,18 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         String idName = safeResName(v);
                         if (LANGUAGE_KEY_ID.equals(idName)) {
                             CharSequence cd = (CharSequence) param.args[0];
-                            if (isLanguageCd(cd)) {
+                            if (isLanguageCd(cd) && !SPOOF_VERSION_TO_DISABLE_EXPERIMENT) {
+                                // Прячем дублирующийся язык ТОЛЬКО если спуфинг
+                                // подписи выключен. Когда спуфинг включён и
+                                // сработал — это и есть настоящая, нужная
+                                // кнопка языка, её как раз надо оставить.
                                 log("hiding language key, cd=\"" + cd + "\"");
                                 v.setVisibility(View.GONE);
                                 v.setClickable(false);
                                 v.setFocusable(false);
+                            } else if (isLanguageCd(cd)) {
+                                log("real language key visible (spoof active), keeping it: cd=\""
+                                        + cd + "\"");
                             } else if (ADD_CUSTOM_GLOBE_BUTTON) {
                                 repurposeAsLanguageKey(v, cd);
                             }
