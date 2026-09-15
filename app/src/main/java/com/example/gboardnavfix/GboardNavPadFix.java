@@ -141,26 +141,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         //     приложение целиком. ---
         installCrashGuard();
 
-        // --- Блокируем сам вызов draw() для скрываемых системных кнопок —
-        //     это устраняет гонку "видно один кадр перед тем, как хук
-        //     видимости успевает сработать" (setVisibility/onAttachedToWindow
-        //     срабатывают на кадр позже реальной отрисовки). Хук на draw()
-        //     гарантирует, что на экран физически ничего не попадёт, даже
-        //     если видимость в моменте ещё не успела примениться. ---
-        XC_MethodHook suppressDrawHook = new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                View v = (View) param.thisObject;
-                if (ALWAYS_HIDDEN_IDS.contains(safeResName(v))) {
-                    param.setResult(null); // полностью пропускаем отрисовку
-                }
-            }
-        };
-        tryHook("android.inputmethodservice.navigationbar.KeyButtonView",
-                lpparam.classLoader, "draw", suppressDrawHook, android.graphics.Canvas.class);
-        tryHook("android.inputmethodservice.navigationbar.NavigationHandle",
-                lpparam.classLoader, "draw", suppressDrawHook, android.graphics.Canvas.class);
-
         // --- ТЕОРИЯ: server-side experiment-флаги (Phenotype/GServices)
         //     привязаны к конкретному versionCode/подписи APK. Когда юзер
         //     пересобирает Gboard под другой версией — флаг "спрячь родную
