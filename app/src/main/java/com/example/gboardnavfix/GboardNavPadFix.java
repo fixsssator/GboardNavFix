@@ -1,10 +1,14 @@
 package com.example.gboardnavfix;
 
+import android.app.Application;
+import android.content.Context;
+import android.content.pm.PackageInfo;
 import android.view.View;
 
-import java.lang.reflect.InvocationHandler;
+import java.io.File;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.Arrays;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -13,26 +17,26 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Gboard 18.2.4 beta / Android 17 fix.
+ * Gboard 18.2.4 beta / Android 17.
  *
- * The beta contains an internal config object with the following fields:
- *   Laeov.a ... Laeov.u : Larzo
- * and Laeov.u corresponds to the config key "keyboardPaddingEnabled".
+ * On every fresh start of Gboard's main process, remove ONLY the cached
+ * Phenotype / Jetpack flag state that controls experiments.  User data such
+ * as the personal dictionary, history and emoji data is not touched.
  *
- * Laeuk.a() builds that config object.  We hook that exact point and replace
- * only the value for keyboardPaddingEnabled with a Larzo proxy returning
- * Boolean.FALSE from gV().  No Gboard data, SharedPreferences or caches are
- * cleared or modified.
+ * The deletion is performed from Application.attach(), before Application
+ * onCreate(), so the cache is gone before normal Gboard initialization.
  *
- * A narrow InputView.setPadding fallback is kept because the beta can still
- * apply a 99 px bottom padding after the config object has been built.
+ * We also spoof only Gboard's versionCode/versionName when it asks the
+ * PackageManager for its own PackageInfo.  Signature spoofing and the global
+ * Signature.equals() hook are deliberately NOT used.
+ *
+ * A narrow InputView.setPadding fallback remains as a visual safety net.
  */
 public final class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final String TAG = "GboardNavFix";
     private static final String GBOARD = "com.google.android.inputmethod.latin";
 
-    // Gboard 18.2.4.969776716-beta-arm64-v8a
     private static final String CONFIG_BUILDER = "Laeuk";
     private static final String CONFIG_VALUE = "Laeov";
     private static final String LARZO = "Larzo";
@@ -40,7 +44,10 @@ public final class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final String INPUT_VIEW =
             "com.google.android.libraries.inputmethod.inputview.InputView";
 
-    private static final boolean KEEP_PADDING_FALLBACK = true;
+    private static final int SPOOF_VERSION_CODE = 999999;
+    private static final String SPOOF_VERSION_NAME = "999.0.0-spoof";
+
+    private static boolean cacheCleanupInstalled;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -48,12 +55,149 @@ public final class GboardNavPadFix implements IXposedHookLoadPackage {
             return;
         }
 
-        log("GboardNavFix loaded: " + lpparam.processName);
+        log("loaded: " + lpparam.processName);
 
+        // Do this first: Application.attach() happens before Application.onCreate().
+        installEarlyCacheCleanup();
+        installVersionSpoof(lpparam.classLoader);
+
+        // Keep the exact config hook as a fallback/diagnostic. It does not
+        // modify any stored data and only affects keyboardPaddingEnabled.
         hookKeyboardPaddingConfig(lpparam.classLoader);
+        hookInputViewPadding();
+    }
 
-        if (KEEP_PADDING_FALLBACK) {
-            hookInputViewPadding(lpparam.classLoader);
+    /**
+     * Deletes only:
+     *   files/phenotype/
+     *   files/phenotype_storage_info/
+     *   files/datastore/flags_jetpack_data_store.pb
+     *
+     * No recursive deletion of the whole files/ or datastore/ directory.
+     */
+    private static synchronized void installEarlyCacheCleanup() {
+        if (cacheCleanupInstalled) {
+            return;
+        }
+        cacheCleanupInstalled = true;
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                    Application.class,
+                    "attach",
+                    Context.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Context context = (Context) param.args[0];
+                                if (context == null) {
+                                    return;
+                                }
+
+                                File files = context.getFilesDir();
+                                if (files == null) {
+                                    log("filesDir is null; cache cleanup skipped");
+                                    return;
+                                }
+
+                                deleteExact(new File(files, "phenotype"));
+                                deleteExact(new File(files, "phenotype_storage_info"));
+                                deleteExact(new File(
+                                        new File(files, "datastore"),
+                                        "flags_jetpack_data_store.pb"));
+                            } catch (Throwable t) {
+                                log("early cache cleanup failed: " + t);
+                            }
+                        }
+                    }
+            );
+            log("hooked Application.attach() for early flag-cache cleanup");
+        } catch (Throwable t) {
+            log("Application.attach hook failed: " + t);
+        }
+    }
+
+    private static void deleteExact(File target) {
+        try {
+            if (!target.exists()) {
+                log("cache not present: " + target.getAbsolutePath());
+                return;
+            }
+
+            boolean ok = deleteRecursively(target);
+            log((ok ? "deleted cache: " : "FAILED to delete cache: ")
+                    + target.getAbsolutePath());
+        } catch (Throwable t) {
+            log("delete failed for " + target + ": " + t);
+        }
+    }
+
+    private static boolean deleteRecursively(File file) {
+        boolean ok = true;
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) {
+                for (File child : children) {
+                    if (!deleteRecursively(child)) {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        return file.delete() && ok;
+    }
+
+    /** Spoof only self PackageInfo; do not touch signatures. */
+    private static void installVersionSpoof(ClassLoader cl) {
+        XC_MethodHook hook = new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                try {
+                    String pkg = (String) param.args[0];
+                    if (!GBOARD.equals(pkg)) {
+                        return;
+                    }
+
+                    Object result = param.getResult();
+                    if (!(result instanceof PackageInfo)) {
+                        return;
+                    }
+
+                    PackageInfo info = (PackageInfo) result;
+                    info.versionCode = SPOOF_VERSION_CODE;
+                    info.versionName = SPOOF_VERSION_NAME;
+
+                    try {
+                        info.getClass().getField("longVersionCode")
+                                .setLong(info, SPOOF_VERSION_CODE);
+                    } catch (Throwable ignored) {
+                        // API/hidden-field differences; versionCode is enough.
+                    }
+                } catch (Throwable t) {
+                    log("version spoof failed: " + t);
+                }
+            }
+        };
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "android.app.ApplicationPackageManager", cl,
+                    "getPackageInfo", String.class, int.class, hook);
+            log("hooked PackageManager.getPackageInfo(String,int)");
+        } catch (Throwable t) {
+            log("legacy PackageManager hook failed: " + t);
+        }
+
+        try {
+            Class<?> flagsClass = Class.forName(
+                    "android.content.pm.PackageManager$PackageInfoFlags", false, cl);
+            XposedHelpers.findAndHookMethod(
+                    "android.app.ApplicationPackageManager", cl,
+                    "getPackageInfo", String.class, flagsClass, hook);
+            log("hooked PackageManager.getPackageInfo(String,PackageInfoFlags)");
+        } catch (Throwable t) {
+            log("PackageInfoFlags hook unavailable: " + t);
         }
     }
 
@@ -69,13 +213,8 @@ public final class GboardNavPadFix implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             Object result = param.getResult();
-                            if (result == null) {
-                                return;
-                            }
-
-                            // Laeuk.a() returns Laeuj, but the concrete object
-                            // created by this beta is Laeov.
-                            if (!CONFIG_VALUE.equals(result.getClass().getName())) {
+                            if (result == null
+                                    || !CONFIG_VALUE.equals(result.getClass().getName())) {
                                 return;
                             }
 
@@ -102,36 +241,25 @@ public final class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static Object createFalseLarzo(final Class<?> larzo, ClassLoader cl) {
         try {
-            InvocationHandler handler = new InvocationHandler() {
-                @Override
-                public Object invoke(Object proxy, Method method, Object[] args) {
-                    String name = method.getName();
-
-                    if ("gV".equals(name) && method.getParameterTypes().length == 0) {
-                        return Boolean.FALSE;
-                    }
-
-                    if ("equals".equals(name)) {
-                        return proxy == (args == null ? null : args[0]);
-                    }
-
-                    if ("hashCode".equals(name)) {
-                        return System.identityHashCode(proxy);
-                    }
-
-                    if ("toString".equals(name)) {
-                        return "GboardNavFix.Larzo(false)";
-                    }
-
-                    // Should not be reached for Larzo in this Gboard build.
-                    return defaultValue(method.getReturnType());
-                }
-            };
-
             return Proxy.newProxyInstance(
                     cl,
                     new Class<?>[]{larzo},
-                    handler
+                    (proxy, method, args) -> {
+                        String name = method.getName();
+                        if ("gV".equals(name) && method.getParameterTypes().length == 0) {
+                            return Boolean.FALSE;
+                        }
+                        if ("equals".equals(name)) {
+                            return proxy == (args == null ? null : args[0]);
+                        }
+                        if ("hashCode".equals(name)) {
+                            return System.identityHashCode(proxy);
+                        }
+                        if ("toString".equals(name)) {
+                            return "GboardNavFix.Larzo(false)";
+                        }
+                        return defaultValue(method.getReturnType());
+                    }
             );
         } catch (Throwable t) {
             log("cannot create Larzo proxy: " + t);
@@ -152,15 +280,12 @@ public final class GboardNavPadFix implements IXposedHookLoadPackage {
         return null;
     }
 
-    private static void hookInputViewPadding(ClassLoader cl) {
+    private static void hookInputViewPadding() {
         try {
             XposedHelpers.findAndHookMethod(
                     View.class,
                     "setPadding",
-                    int.class,
-                    int.class,
-                    int.class,
-                    int.class,
+                    int.class, int.class, int.class, int.class,
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
@@ -177,6 +302,7 @@ public final class GboardNavPadFix implements IXposedHookLoadPackage {
                         }
                     }
             );
+            log("hooked InputView.setPadding fallback");
         } catch (Throwable t) {
             log("InputView.setPadding hook failed: " + t);
         }
