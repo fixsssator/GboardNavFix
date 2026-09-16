@@ -13,7 +13,6 @@ import java.util.Set;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
@@ -141,7 +140,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         //     а глушим именно это конкретное исключение, чтобы оно не убивало
         //     приложение целиком. ---
         installCrashGuard();
-        installWorkerCrashGuard(lpparam.classLoader);
+        installSignatureEqualsGuard();
 
         // --- ТЕОРИЯ: server-side experiment-флаги (Phenotype/GServices)
         //     привязаны к конкретному versionCode/подписи APK. Когда юзер
@@ -544,38 +543,29 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
     }
 
-    private void installWorkerCrashGuard(ClassLoader cl) {
-        // Ловим исключение прямо у источника — оборачиваем run() у воркеров
-        // ThreadPoolExecutor (это JDK-класс, общий для ЛЮБых пулов потоков
-        // в процессе, но мы гасим только ОДНО конкретное исключение по
-        // сообщению, остальное пробрасываем как было). Это надёжнее, чем
-        // Thread.setDefaultUncaughtExceptionHandler(), потому что у самого
-        // потока/пула может быть свой обработчик с более высоким приоритетом,
-        // который наш дефолтный хендлер никогда не увидит.
+    private void installSignatureEqualsGuard() {
+        // Не ловим исключение постфактум, а не даём ему вообще возникнуть:
+        // внутренняя проверка Gboard сравнивает подписи через обычный,
+        // необфусцированный android.content.pm.Signature.equals() —
+        // если он всегда отвечает "совпадает", несоответствие просто
+        // никогда не обнаруживается, и исключение не бросается вовсе.
+        // Не трогает ThreadPoolExecutor/воркеры — никакой рваной бухгалтерии
+        // пула потоков, задача просто успешно завершается как обычно.
         try {
-            Class<?> workerClass = Class.forName(
-                    "java.util.concurrent.ThreadPoolExecutor$Worker", false, cl);
-            XposedBridge.hookMethod(
-                    workerClass.getDeclaredMethod("run"),
-                    new XC_MethodReplacement() {
+            XposedHelpers.findAndHookMethod(
+                    android.content.pm.Signature.class,
+                    "equals",
+                    Object.class,
+                    new XC_MethodHook() {
                         @Override
-                        protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
-                            try {
-                                return XposedBridge.invokeOriginalMethod(
-                                        param.method, param.thisObject, param.args);
-                            } catch (Throwable t) {
-                                if (isSelfInflictedSignatureCrash(t)) {
-                                    log("swallowed self-inflicted signature-check crash at source: " + t);
-                                    return null;
-                                }
-                                throw t;
-                            }
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            param.setResult(true);
                         }
                     }
             );
-            log("installed worker-level crash guard");
+            log("installed Signature.equals() guard");
         } catch (Throwable t) {
-            log("installWorkerCrashGuard failed: " + t);
+            log("installSignatureEqualsGuard failed: " + t);
         }
     }
 
