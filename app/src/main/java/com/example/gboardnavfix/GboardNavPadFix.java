@@ -140,7 +140,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         //     а глушим именно это конкретное исключение, чтобы оно не убивало
         //     приложение целиком. ---
         installCrashGuard();
-        installSignatureEqualsGuard();
 
         // --- ТЕОРИЯ: server-side experiment-флаги (Phenotype/GServices)
         //     привязаны к конкретному versionCode/подписи APK. Когда юзер
@@ -540,32 +539,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         }
                     }
             );
-        }
-    }
-
-    private void installSignatureEqualsGuard() {
-        // Не ловим исключение постфактум, а не даём ему вообще возникнуть:
-        // внутренняя проверка Gboard сравнивает подписи через обычный,
-        // необфусцированный android.content.pm.Signature.equals() —
-        // если он всегда отвечает "совпадает", несоответствие просто
-        // никогда не обнаруживается, и исключение не бросается вовсе.
-        // Не трогает ThreadPoolExecutor/воркеры — никакой рваной бухгалтерии
-        // пула потоков, задача просто успешно завершается как обычно.
-        try {
-            XposedHelpers.findAndHookMethod(
-                    android.content.pm.Signature.class,
-                    "equals",
-                    Object.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            param.setResult(true);
-                        }
-                    }
-            );
-            log("installed Signature.equals() guard");
-        } catch (Throwable t) {
-            log("installSignatureEqualsGuard failed: " + t);
         }
     }
 
