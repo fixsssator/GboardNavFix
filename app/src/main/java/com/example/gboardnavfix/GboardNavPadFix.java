@@ -2,6 +2,8 @@ package com.example.gboardnavfix;
 
 import android.app.Application;
 import android.content.Context;
+import android.content.pm.ProviderInfo;
+import android.content.ContentProvider;
 import android.content.pm.PackageInfo;
 import android.view.View;
 
@@ -55,10 +57,12 @@ public final class GboardNavPadFix implements IXposedHookLoadPackage {
             return;
         }
 
-        log("loaded: " + lpparam.processName);
+        log(">>> PROCESS START <<< " + lpparam.processName);
+        log("module build: CACHE_CLEANUP_DIAG_2");
 
         // Do this first: Application.attach() happens before Application.onCreate().
         installEarlyCacheCleanup();
+        installProviderCacheCleanup(lpparam.classLoader);
         installVersionSpoof(lpparam.classLoader);
 
         // Keep the exact config hook as a fallback/diagnostic. It does not
@@ -75,6 +79,55 @@ public final class GboardNavPadFix implements IXposedHookLoadPackage {
      *
      * No recursive deletion of the whole files/ or datastore/ directory.
      */
+    /**
+     * Provider fallback: some Gboard flag/Phenotype components may initialize
+     * through a ContentProvider before Application.attach().  Hook both
+     * ContentProvider.attachInfo overloads and clean the exact same three
+     * paths from the provider context.
+     */
+    private static void installProviderCacheCleanup(ClassLoader cl) {
+        XC_MethodHook hook = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                try {
+                    Context context = (Context) param.args[0];
+                    if (context == null) return;
+                    log(">>> PROVIDER attachInfo: " + param.thisObject.getClass().getName());
+                    cleanupCaches(context, "provider");
+                } catch (Throwable t) {
+                    log("provider cache cleanup failed: " + t);
+                }
+            }
+        };
+        try {
+            XposedHelpers.findAndHookMethod(ContentProvider.class, "attachInfo",
+                    Context.class, ProviderInfo.class, hook);
+            log("hooked ContentProvider.attachInfo(Context,ProviderInfo)");
+        } catch (Throwable t) {
+            log("ContentProvider.attachInfo hook failed: " + t);
+        }
+        try {
+            XposedHelpers.findAndHookMethod(ContentProvider.class, "attachInfo",
+                    Context.class, ProviderInfo.class, boolean.class, hook);
+            log("hooked ContentProvider.attachInfo(Context,ProviderInfo,boolean)");
+        } catch (Throwable t) {
+            log("ContentProvider.attachInfo(3) unavailable: " + t);
+        }
+    }
+
+    private static void cleanupCaches(Context context, String source) {
+        File files = context.getFilesDir();
+        if (files == null) {
+            log(source + ": filesDir is null");
+            return;
+        }
+        log(source + ": filesDir=" + files.getAbsolutePath());
+        deleteExact(new File(files, "phenotype"));
+        deleteExact(new File(files, "phenotype_storage_info"));
+        deleteExact(new File(new File(files, "datastore"),
+                "flags_jetpack_data_store.pb"));
+    }
+
     private static synchronized void installEarlyCacheCleanup() {
         if (cacheCleanupInstalled) {
             return;
@@ -95,17 +148,7 @@ public final class GboardNavPadFix implements IXposedHookLoadPackage {
                                     return;
                                 }
 
-                                File files = context.getFilesDir();
-                                if (files == null) {
-                                    log("filesDir is null; cache cleanup skipped");
-                                    return;
-                                }
-
-                                deleteExact(new File(files, "phenotype"));
-                                deleteExact(new File(files, "phenotype_storage_info"));
-                                deleteExact(new File(
-                                        new File(files, "datastore"),
-                                        "flags_jetpack_data_store.pb"));
+                                cleanupCaches(context, "Application.attach");
                             } catch (Throwable t) {
                                 log("early cache cleanup failed: " + t);
                             }
