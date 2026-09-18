@@ -19,17 +19,6 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
  * Убирает пустой нижний отступ у Gboard на Pixel.
- *
- * Диагностика показала цепочку:
- *   CopyImageSourceView (h=103)
- *     ← ScaledKeyboardViewInner (h=103)
- *       ← SoftKeyboardView (h=103)
- *         ← KeyboardViewHolder (h=103)
- *           ← KeyboardHolder (h=498)
- *             ← LinearLayout (h=541)
- *
- * Полосу создаёт разница между KeyboardHolder (498) и LinearLayout (541),
- * плюс InputView paddingBottom=99. Работаем по обоим фронтам.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -45,7 +34,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final String COPY_IMAGE_SRC_CLASS =
             "com.google.android.libraries.inputmethod.widgets.CopyImageSourceView";
 
-    // Класс KeyboardHolder — родитель клавиатуры, у которого h=498
     private static final String KEYBOARD_HOLDER_CLASS =
             "com.google.android.libraries.inputmethod.keyboard.impl.KeyboardHolder";
 
@@ -69,8 +57,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
     private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
-    private static final boolean USE_NAVBAR_TREE_DUMP = true;
-    private static final boolean USE_CHAIN_DUMP = true;
+    private static final boolean USE_NAVBAR_TREE_DUMP = false;
+    private static final boolean USE_CHAIN_DUMP = false;
 
     private static final String[] PHENOTYPE_CACHE_PATHS = {
             "files/phenotype",
@@ -115,6 +103,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isKeyboardHolder(View v) {
         return KEYBOARD_HOLDER_CLASS.equals(v.getClass().getName());
+    }
+
+    private static boolean isInputView(View v) {
+        return TARGET_VIEW_CLASS.equals(v.getClass().getName());
     }
 
     @Override
@@ -234,7 +226,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 Drawable.class
         );
 
-        // ============ InputView padding ============
+        // ============ setPadding на InputView / NavigationBarFrame / KeyboardHolder ============
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setPadding",
@@ -474,12 +466,84 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         );
 
         // ============================================================
-        // KeyboardHolder — родитель клавиатуры, h=498
+        // InputView — главный подозреваемый
+        // ============================================================
+        try {
+            Class<?> inputViewClass = Class.forName(
+                    TARGET_VIEW_CLASS, false, lpparam.classLoader);
+
+            // 1. onMeasure — после super, если padB > 0 — зануляем
+            XposedHelpers.findAndHookMethod(
+                    inputViewClass,
+                    "onMeasure",
+                    int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            int h = v.getMeasuredHeight();
+                            int padB = v.getPaddingBottom();
+                            log("InputView.onMeasure: mh=" + h + ", padB=" + padB);
+                            if (padB > 0) {
+                                v.setPadding(v.getPaddingLeft(), v.getPaddingTop(),
+                                             v.getPaddingRight(), 0);
+                            }
+                        }
+                    }
+            );
+
+            // 2. onLayout — после super логируем
+            XposedHelpers.findAndHookMethod(
+                    inputViewClass,
+                    "onLayout",
+                    boolean.class, int.class, int.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            log("InputView.onLayout: h=" + v.getHeight()
+                                    + ", bottom=" + v.getBottom()
+                                    + ", padB=" + v.getPaddingBottom());
+                        }
+                    }
+            );
+
+            log("hooked InputView.onMeasure + onLayout");
+        } catch (Throwable t) {
+            log("failed to hook InputView: " + t);
+        }
+
+        // ============================================================
+        // LinearLayout (h=541) — родитель KeyboardHolder
+        // ============================================================
+        XposedHelpers.findAndHookMethod(
+                android.widget.LinearLayout.class,
+                "onMeasure",
+                int.class, int.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        View v = (View) param.thisObject;
+                        int h = v.getMeasuredHeight();
+                        if (h >= 500 && h <= 600) {
+                            log("LinearLayout.onMeasure: mh=" + h
+                                    + ", padB=" + v.getPaddingBottom()
+                                    + ", id=" + safeResName(v));
+                            if (v.getPaddingBottom() > 0) {
+                                v.setPadding(v.getPaddingLeft(), v.getPaddingTop(),
+                                             v.getPaddingRight(), 0);
+                            }
+                        }
+                    }
+                }
+        );
+
+        // ============================================================
+        // KeyboardHolder — родитель клавиатуры
         // ============================================================
         try {
             Class<?> khClass = Class.forName(KEYBOARD_HOLDER_CLASS, false, lpparam.classLoader);
 
-            // 1. onMeasure — после super логируем результат
             XposedHelpers.findAndHookMethod(
                     khClass,
                     "onMeasure",
@@ -494,7 +558,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
             );
 
-            // 2. setLayoutParams — зануляем высоту
             XposedHelpers.findAndHookMethod(
                     khClass,
                     "setLayoutParams",
@@ -518,46 +581,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         // ============================================================
-        // CopyImageSourceView — цепочка хуков (на всякий случай)
+        // CopyImageSourceView — оставляем на всякий случай
         // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(
-                    ViewGroup.class,
-                    "measureChild",
-                    View.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            View child = (View) param.args[0];
-                            if (child == null || !isCopyImageSrc(child)) return;
-                            param.args[2] = View.MeasureSpec.makeMeasureSpec(
-                                    0, View.MeasureSpec.EXACTLY);
-                        }
-                    }
-            );
-        } catch (Throwable t) {
-            log("failed to hook measureChild: " + t);
-        }
-
-        try {
-            XposedHelpers.findAndHookMethod(
-                    ViewGroup.class,
-                    "measureChildWithMargins",
-                    View.class, int.class, int.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            View child = (View) param.args[0];
-                            if (child == null || !isCopyImageSrc(child)) return;
-                            param.args[3] = View.MeasureSpec.makeMeasureSpec(
-                                    0, View.MeasureSpec.EXACTLY);
-                        }
-                    }
-            );
-        } catch (Throwable t) {
-            log("failed to hook measureChildWithMargins: " + t);
-        }
-
         try {
             XposedHelpers.findAndHookMethod(
                     View.class,
@@ -569,8 +594,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             View v = (View) param.thisObject;
                             if (!isCopyImageSrc(v)) return;
                             if (v.getHeight() != 0) {
-                                log("CopyImageSourceView.onLayout h=" + v.getHeight()
-                                        + " → collapse");
                                 v.layout(v.getLeft(), v.getTop(),
                                          v.getRight(), v.getTop());
                             }
@@ -578,11 +601,11 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
             );
         } catch (Throwable t) {
-            log("failed to hook onLayout: " + t);
+            log("failed to hook CopyImageSourceView onLayout: " + t);
         }
 
         // ============================================================
-        // CHAIN DUMP — высоты всей цепочки до InputView
+        // ДАМП (отключён по умолчанию)
         // ============================================================
         if (USE_CHAIN_DUMP) {
             XposedHelpers.findAndHookMethod(
@@ -619,12 +642,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         }
                     }
             );
-            log("CHAIN dump enabled");
         }
 
-        // ============================================================
-        // УМНЫЙ ДАМП с цепочкой родителей
-        // ============================================================
         if (USE_NAVBAR_TREE_DUMP) {
             XposedHelpers.findAndHookMethod(
                     View.class,
@@ -675,7 +694,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         }
                     }
             );
-            log("smart onLayout dump with parents enabled");
         }
 
         // ============ Отладка ============
