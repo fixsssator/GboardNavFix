@@ -3,6 +3,7 @@ package com.example.gboardnavfix;
 import android.content.res.Resources;
 import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
+import android.util.DisplayMetrics;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageView;
@@ -20,6 +21,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Убирает пустой нижний отступ у Gboard, который система резервирует
  * под жестовую навигацию / nav bar.
+ *
+ * Идея: Gboard не хранит размер этого отступа в собственных (обфусцированных)
+ * ресурсах — он читает стандартные системные dimen-ресурсы фреймворка
+ * android:dimen/navigation_bar_height и android:dimen/navigation_bar_frame_height.
+ * Хук перехватывает Resources.getDimensionPixelSize(int) и обнуляет результат,
+ * если запрашиваемый ресурс — один из этих. Скоуп ограничен пакетом Gboard,
+ * поэтому на остальную систему (SystemUI и т.д.) это не влияет.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -39,25 +47,62 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             "navigation_bar_width"
     };
 
-    // Системные кнопки встроенной IME nav bar — скрываем безусловно
+    // Системные кнопки встроенной IME nav bar — скрываем безусловно,
+    // это framework-классы, они всегда одна и та же функция.
     private static final Set<String> ALWAYS_HIDDEN_IDS = new HashSet<>(Arrays.asList(
             "input_method_nav_back",
             "input_method_nav_ime_switcher",
             "input_method_nav_home_handle"
     ));
 
-    // ID переиспользуемой кнопки переключения языка / эмодзи
+    // ВАЖНО: этот ID у Gboard переиспользуется под разные функции в
+    // зависимости от контекста поля ввода.
     private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
 
+    // Спуфинг versionCode/versionName/подписи для отключения эксперимента.
     private static final boolean SPOOF_VERSION_TO_DISABLE_EXPERIMENT = true;
+
+    // Кастомная кнопка "глобус" — выключена (не работает через рефлексию).
     private static final boolean ADD_CUSTOM_GLOBE_BUTTON = false;
+
+    // Отладочные флаги
+    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
+    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
+    private static final boolean USE_NAVBAR_TREE_DUMP = false;
 
     // Класс системного контейнера IME nav bar
     private static final String NAV_BAR_FRAME_CLASS =
             "android.inputmethodservice.navigationbar.NavigationBarFrame";
 
+    // Пути внутри /data/data/<pkg>/, где Gboard хранит кэш решения
+    // эксперимента Phenotype между запусками.
+    private static final String[] PHENOTYPE_CACHE_PATHS = {
+            "files/phenotype",
+            "files/phenotype_storage_info",
+            "files/datastore/flags_jetpack_data_store.pb",
+            "shared_prefs",
+            "databases"
+    };
+
+    private static final String REPURPOSED_TAG = "gboardnavfix_repurposed";
+
+    // Ссылка на запущенный сервис клавиатуры
     private static volatile InputMethodService sImeService;
+
+    // Настоящая иконка системной кнопки "Switch input method"
     private static volatile Drawable sLanguageIconDrawable;
+
+    private static void tryHook(String className, ClassLoader cl, String methodName,
+                                 XC_MethodHook hook, Object... paramTypes) {
+        try {
+            Object[] args = Arrays.copyOf(paramTypes, paramTypes.length + 1);
+            args[paramTypes.length] = hook;
+            XposedHelpers.findAndHookMethod(className, cl, methodName, args);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": tryHook failed for " + methodName
+                    + Arrays.toString(paramTypes) + ": " + t);
+        }
+    }
 
     private static boolean isAlwaysHidden(View v, String idName) {
         return ALWAYS_HIDDEN_IDS.contains(idName);
@@ -77,13 +122,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
         log("hooking into Gboard, process=" + lpparam.processName);
 
-        // --- Чистим кэш Phenotype-эксперимента ---
+        // Чистим Phenotype-кэш на каждом старте процесса
         wipePhenotypeCache();
 
-        // --- Глушим краш подписи сплитов после спуфинга ---
+        // Глушим self-inflicted signature-check crash
         installCrashGuard();
 
-        // --- Спуфинг versionCode / versionName / signature ---
+        // Спуфинг versionCode/versionName/подписи
         if (SPOOF_VERSION_TO_DISABLE_EXPERIMENT) {
             XC_MethodHook spoofHook = new XC_MethodHook() {
                 @Override
@@ -96,7 +141,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         XposedHelpers.setIntField(info, "versionCode", 999999);
                         try {
                             XposedHelpers.setLongField(info, "versionCodeMajor", 0L);
-                        } catch (Throwable ignored) {}
+                        } catch (Throwable ignored) {
+                        }
                         XposedHelpers.setObjectField(info, "versionName", "999.0.0-spoof");
                         spoofSignatureFields(info);
                         log("spoofed self versionCode/versionName/signature for " + pkg);
@@ -113,22 +159,28 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         false, lpparam.classLoader);
                 tryHook("android.app.ApplicationPackageManager", lpparam.classLoader,
                         "getPackageInfo", spoofHook, String.class, flagsClass);
-            } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+                // API < 33, такого перегруза нет
+            }
         }
 
-        // --- Запоминаем инстанс сервиса клавиатуры ---
-        XposedHelpers.findAndHookMethod(
-                InputMethodService.class,
-                "onCreate",
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        sImeService = (InputMethodService) param.thisObject;
+        // Запоминаем инстанс сервиса клавиатуры
+        try {
+            XposedHelpers.findAndHookMethod(
+                    InputMethodService.class,
+                    "onCreate",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            sImeService = (InputMethodService) param.thisObject;
+                        }
                     }
-                }
-        );
+            );
+        } catch (Throwable t) {
+            log("failed to hook InputMethodService.onCreate: " + t);
+        }
 
-        // --- Перехватываем НАСТОЯЩУЮ иконку системной кнопки языка ---
+        // Перехватываем настоящую иконку системной кнопки языка
         tryHook(
                 "android.inputmethodservice.navigationbar.KeyButtonView",
                 lpparam.classLoader,
@@ -155,47 +207,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 Drawable.class
         );
 
-        // --- Мгновенный перехват рождения дочерних элементов (защита от гонки) ---
-        XposedHelpers.findAndHookMethod(
-                ViewGroup.class,
-                "setOnHierarchyChangeListener",
-                ViewGroup.OnHierarchyChangeListener.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        ViewGroup vg = (ViewGroup) param.thisObject;
-                        String cls = vg.getClass().getName();
-                        if (cls.contains("navigationbar") || cls.contains("inputview")) {
-                            ViewGroup.OnHierarchyChangeListener original =
-                                    (ViewGroup.OnHierarchyChangeListener) param.args[0];
-                            param.args[0] = new ViewGroup.OnHierarchyChangeListener() {
-                                @Override
-                                public void onChildViewAdded(View parent, View child) {
-                                    String idName = safeResName(child);
-                                    if (isAlwaysHidden(child, idName)) {
-                                        child.setVisibility(View.GONE);
-                                        child.setClickable(false);
-                                        child.setFocusable(false);
-                                        log("instant hide on addView (vector): " + idName);
-                                    } else if (LANGUAGE_KEY_ID.equals(idName)
-                                            && isLanguageCd(child.getContentDescription())) {
-                                        if (!SPOOF_VERSION_TO_DISABLE_EXPERIMENT) {
-                                            child.setVisibility(View.GONE);
-                                            log("instant hide language key on addView (vector)");
-                                        }
-                                    }
-                                    if (original != null) original.onChildViewAdded(parent, child);
-                                }
-                                @Override
-                                public void onChildViewRemoved(View parent, View child) {
-                                    if (original != null) original.onChildViewRemoved(parent, child);
-                                }
-                            };
-                        }
-                    }
-                }
-        );
-
         // --- Основной рабочий хук: обнуляем bottom-padding у InputView ---
         XposedHelpers.findAndHookMethod(
                 View.class,
@@ -206,17 +217,17 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
-                            int bottom = (int) param.args;
+                            int bottom = (int) param.args[3];
                             if (bottom > 0) {
                                 log("zeroing InputView bottom padding, was=" + bottom);
-                                param.args = 0;
+                                param.args[3] = 0;
                             }
                         }
                     }
                 }
         );
 
-        // setPaddingRelative
+        // Некоторые View используют setPaddingRelative
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setPaddingRelative",
@@ -226,17 +237,17 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
-                            int bottom = (int) param.args;
+                            int bottom = (int) param.args[3];
                             if (bottom > 0) {
                                 log("zeroing InputView bottom padding (relative), was=" + bottom);
-                                param.args = 0;
+                                param.args[3] = 0;
                             }
                         }
                     }
                 }
         );
 
-        // Резервные хуки getDimensionPixelSize / getDimension
+        // --- Резервные хуки по имени ресурса ---
         XposedHelpers.findAndHookMethod(
                 Resources.class,
                 "getDimensionPixelSize",
@@ -265,7 +276,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // setVisibility()
+        // --- Скрываем системные элементы встроенной IME nav bar ---
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setVisibility",
@@ -277,7 +288,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         String idName = safeResName(v);
                         if (isAlwaysHidden(v, idName)) {
                             if ((int) param.args[0] != View.GONE) {
-                                log("forcing GONE on id=" + idName);
+                                log("forcing GONE on id=" + idName
+                                        + " (was requesting visibility=" + param.args[0] + ")");
                                 param.args[0] = View.GONE;
                             }
                         } else if (LANGUAGE_KEY_ID.equals(idName)
@@ -290,7 +302,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // performClick
+        // Блокируем клик по скрываемым кнопкам
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "performClick",
@@ -311,7 +323,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // setOnClickListener подстраховка
+        // Подстраховка: скрываем при setOnClickListener
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setOnClickListener",
@@ -328,7 +340,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // onAttachedToWindow
+        // Скрываем системные элементы при attach + зануляем NavigationBarFrame
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "onAttachedToWindow",
@@ -357,7 +369,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // setContentDescription
+        // --- Решающая проверка для key_pos_switch_to_next_language ---
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setContentDescription",
@@ -375,7 +387,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 v.setClickable(false);
                                 v.setFocusable(false);
                             } else if (isLanguageCd(cd)) {
-                                log("real language key visible (spoof active): cd=\"" + cd + "\"");
+                                log("real language key visible (spoof active), keeping it: cd=\""
+                                        + cd + "\"");
                             } else if (ADD_CUSTOM_GLOBE_BUTTON) {
                                 repurposeAsLanguageKey(v, cd);
                             }
@@ -383,13 +396,84 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 }
         );
+
+        // --- Отладочное логирование ---
+        if (USE_VIEW_FALLBACK_DEBUG_LOGGING) {
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "setPadding",
+                    int.class, int.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            int bottom = (int) param.args[3];
+                            if (bottom > 0) {
+                                View v = (View) param.thisObject;
+                                log("setPadding bottom=" + bottom
+                                        + " on " + v.getClass().getName());
+                            }
+                        }
+                    }
+            );
+        }
+
+        if (USE_TOOLBAR_DEBUG_LOGGING) {
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "setContentDescription",
+                    CharSequence.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            CharSequence cd = (CharSequence) param.args[0];
+                            if (cd != null && cd.length() > 0) {
+                                View v = (View) param.thisObject;
+                                log("contentDescription=\"" + cd + "\" on "
+                                        + v.getClass().getName()
+                                        + " id=" + safeResName(v));
+                            }
+                        }
+                    }
+            );
+
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "setOnClickListener",
+                    View.OnClickListener.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            log("setOnClickListener on " + v.getClass().getName()
+                                    + " id=" + safeResName(v)
+                                    + " cd=" + v.getContentDescription());
+                        }
+                    }
+            );
+        }
+
+        if (USE_NAVBAR_TREE_DUMP) {
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "onAttachedToWindow",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            String cls = v.getClass().getName();
+                            if (cls.startsWith("android.inputmethodservice.navigationbar")) {
+                                log("navbar-tree: class=" + cls
+                                        + " id=" + safeResName(v)
+                                        + " visibility=" + v.getVisibility()
+                                        + " cd=" + v.getContentDescription());
+                            }
+                        }
+                    }
+            );
+        }
     }
 
-    private static final String[] PHENOTYPE_CACHE_PATHS = {
-            "files/phenotype",
-            "files/phenotype_storage_info",
-            "files/datastore/flags_jetpack_data_store.pb"
-    };
+    // ===================== Phenotype cache =====================
 
     private void wipePhenotypeCache() {
         String base = "/data/data/" + GBOARD_PKG + "/";
@@ -417,6 +501,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
         return f.delete();
     }
+
+    // ===================== Crash guard =====================
 
     private void installCrashGuard() {
         try {
@@ -458,6 +544,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         return false;
     }
 
+    // ===================== Signature spoofing =====================
+
     private void spoofSignatureFields(Object packageInfo) {
         try {
             android.content.pm.Signature dummy = new android.content.pm.Signature(
@@ -467,11 +555,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             try {
                 XposedHelpers.setObjectField(packageInfo, "signatures",
                         new android.content.pm.Signature[]{dummy});
-            } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+            }
             try {
                 Object signingInfo = XposedHelpers.getObjectField(packageInfo, "signingInfo");
                 patchSignaturesRecursively(signingInfo, dummy, 3);
-            } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+            }
         } catch (Throwable t) {
             log("spoofSignatureFields failed: " + t);
         }
@@ -495,11 +585,14 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             patchSignaturesRecursively(nested, dummy, depth - 1);
                         }
                     }
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
             }
             cls = cls.getSuperclass();
         }
     }
+
+    // ===================== Helpers =====================
 
     private String safeResName(View v) {
         try {
@@ -510,8 +603,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             return "?";
         }
     }
-
-    private static final String REPURPOSED_TAG = "gboardnavfix_repurposed";
 
     private void repurposeAsLanguageKey(View v, CharSequence originalCd) {
         try {
@@ -547,7 +638,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
             });
             v.setTag(REPURPOSED_TAG);
-            log("repurposed emoji-slot key as language switch, iconSet=" + iconSet);
+            log("repurposed emoji-slot key as language switch, iconSet=" + iconSet
+                    + " class=" + v.getClass().getName() + " originalCd=\"" + originalCd + "\"");
         } catch (Throwable t) {
             log("repurposeAsLanguageKey failed: " + t);
         }
@@ -565,24 +657,16 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 : sLanguageIconDrawable;
                         f.set(v, fresh);
                         v.invalidate();
+                        log("repurpose: set drawable field '" + f.getName()
+                                + "' on " + cls.getName());
                         return true;
-                    } catch (Throwable ignored) {}
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
             cls = cls.getSuperclass();
         }
         return false;
-    }
-
-    private static void tryHook(String className, ClassLoader cl, String methodName,
-                                XC_MethodHook hook, Object... paramTypes) {
-        try {
-            Object[] args = Arrays.copyOf(paramTypes, paramTypes.length + 1);
-            args[paramTypes.length] = hook;
-            XposedHelpers.findAndHookMethod(className, cl, methodName, args);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "[vector]: tryHook failed for " + methodName + ": " + t);
-        }
     }
 
     private void maybeZeroOut(XC_MethodHook.MethodHookParam param) {
@@ -599,13 +683,16 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             String name = res.getResourceEntryName(resId);
             if (name == null) return false;
             for (String target : TARGET_DIMEN_NAMES) {
-                if (target.equals(name)) return true;
+                if (target.equals(name)) {
+                    return true;
+                }
             }
-        } catch (Resources.NotFoundException ignored) {}
+        } catch (Resources.NotFoundException ignored) {
+        }
         return false;
     }
 
     private void log(String msg) {
-        XposedBridge.log(String.format("[%s][vector] %s", TAG, msg));
+        XposedBridge.log(TAG + ": " + msg);
     }
 }
