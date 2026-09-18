@@ -19,17 +19,30 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
  * Убирает пустой нижний отступ у Gboard на Pixel.
+ *
+ * Настоящий виновник найден через smart onLayout dump:
+ *   com.google.android.libraries.inputmethod.widgets.CopyImageSourceView
+ *   с h=103, bottom=103 — это spacer внизу клавиатуры.
+ *
+ * Плюс: спуфинг versionCode/versionName/подписи для отключения
+ * server-side эксперимента Gboard.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final String TAG = "GboardNavFix";
     private static final String GBOARD_PKG = "com.google.android.inputmethod.latin";
 
+    // Корневой view клавиатуры (bottom padding = 99)
     private static final String TARGET_VIEW_CLASS =
             "com.google.android.libraries.inputmethod.inputview.InputView";
 
+    // Системный контейнер IME nav bar
     private static final String NAV_BAR_FRAME_CLASS =
             "android.inputmethodservice.navigationbar.NavigationBarFrame";
+
+    // НАСТОЯЩИЙ ВИНОВНИК — spacer внизу клавиатуры
+    private static final String COPY_IMAGE_SRC_CLASS =
+            "com.google.android.libraries.inputmethod.widgets.CopyImageSourceView";
 
     private static final String[] TARGET_DIMEN_NAMES = {
             "navigation_bar_height",
@@ -51,8 +64,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
     private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
-
-    // УМНЫЙ ФИЛЬТР вместо тяжёлого рекурсивного дампа
     private static final boolean USE_NAVBAR_TREE_DUMP = true;
 
     private static final String[] PHENOTYPE_CACHE_PATHS = {
@@ -90,6 +101,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isNavBarFrame(View v) {
         return NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
+    }
+
+    private static boolean isCopyImageSrc(View v) {
+        return COPY_IMAGE_SRC_CLASS.equals(v.getClass().getName());
     }
 
     @Override
@@ -253,7 +268,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // ============ NavigationBarFrame: setMinimumHeight ============
+        // ============ NavigationBarFrame ============
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setMinimumHeight",
@@ -273,7 +288,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // ============ NavigationBarFrame: setLayoutParams ============
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setLayoutParams",
@@ -435,6 +449,76 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         );
 
         // ============================================================
+        // ТОЧЕЧНЫЙ ХУК: CopyImageSourceView (h=103, bottom=103)
+        // ============================================================
+        try {
+            Class<?> copyCls = Class.forName(COPY_IMAGE_SRC_CLASS, false, lpparam.classLoader);
+
+            // 1. setMinimumHeight → 0
+            XposedHelpers.findAndHookMethod(
+                    copyCls,
+                    "setMinimumHeight",
+                    int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            int h = (int) param.args[0];
+                            if (h > 0) {
+                                log("CopyImageSourceView.setMinimumHeight → 0, was=" + h);
+                                param.args[0] = 0;
+                            }
+                        }
+                    }
+            );
+
+            // 2. onMeasure — принудительно высота 0
+            XposedHelpers.findAndHookMethod(
+                    copyCls,
+                    "onMeasure",
+                    int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            param.args[1] = View.MeasureSpec.makeMeasureSpec(
+                                    0, View.MeasureSpec.EXACTLY);
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            if (v.getMeasuredHeight() != 0) {
+                                v.setMeasuredDimension(v.getMeasuredWidth(), 0);
+                                log("forced CopyImageSourceView measuredHeight=0");
+                            }
+                        }
+                    }
+            );
+
+            // 3. onLayout — если всё равно распёрло, схлопываем
+            XposedHelpers.findAndHookMethod(
+                    copyCls,
+                    "onLayout",
+                    boolean.class, int.class, int.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            if (v.getHeight() != 0) {
+                                log("CopyImageSourceView.onLayout h=" + v.getHeight()
+                                        + " → collapse");
+                                v.layout(v.getLeft(), v.getTop(),
+                                         v.getRight(), v.getTop());
+                            }
+                        }
+                    }
+            );
+
+            log("hooked CopyImageSourceView (точный виновник)");
+        } catch (Throwable t) {
+            log("failed to hook CopyImageSourceView: " + t);
+        }
+
+        // ============================================================
         // УМНЫЙ ДАМП ДЕРЕВА VIEW по onLayout с фильтром по высоте
         // ============================================================
         if (USE_NAVBAR_TREE_DUMP) {
@@ -472,7 +556,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                             tag));
                                 }
                             } catch (Throwable t) {
-                                // не валим хук из-за одной view
                             }
                         }
                     }
