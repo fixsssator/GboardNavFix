@@ -19,6 +19,15 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
  * Убирает пустой нижний отступ у Gboard на Pixel.
+ *
+ * Диагностика показала:
+ *   InputView.onMeasure: mh=2205, padB=0
+ *   InputView.onLayout: h=2205
+ *   LinearLayout (внутри): mh=541
+ *
+ * InputView растянут на 2205px, а клавиатура внутри — всего 541px.
+ * Разница = пустая зона под клавиатурой. Решение: после super.onMeasure
+ * схлопываем InputView до высоты его самого высокого видимого ребёнка.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -30,12 +39,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final String NAV_BAR_FRAME_CLASS =
             "android.inputmethodservice.navigationbar.NavigationBarFrame";
-
-    private static final String COPY_IMAGE_SRC_CLASS =
-            "com.google.android.libraries.inputmethod.widgets.CopyImageSourceView";
-
-    private static final String KEYBOARD_HOLDER_CLASS =
-            "com.google.android.libraries.inputmethod.keyboard.impl.KeyboardHolder";
 
     private static final String[] TARGET_DIMEN_NAMES = {
             "navigation_bar_height",
@@ -57,8 +60,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
     private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
-    private static final boolean USE_NAVBAR_TREE_DUMP = false;
-    private static final boolean USE_CHAIN_DUMP = false;
 
     private static final String[] PHENOTYPE_CACHE_PATHS = {
             "files/phenotype",
@@ -95,14 +96,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isNavBarFrame(View v) {
         return NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
-    }
-
-    private static boolean isCopyImageSrc(View v) {
-        return COPY_IMAGE_SRC_CLASS.equals(v.getClass().getName());
-    }
-
-    private static boolean isKeyboardHolder(View v) {
-        return KEYBOARD_HOLDER_CLASS.equals(v.getClass().getName());
     }
 
     private static boolean isInputView(View v) {
@@ -226,7 +219,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 Drawable.class
         );
 
-        // ============ setPadding на InputView / NavigationBarFrame / KeyboardHolder ============
+        // ============ setPadding ============
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setPadding",
@@ -248,13 +241,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 param.args[3] = 0;
                             }
                         }
-                        if (isKeyboardHolder(v)) {
-                            int bottom = (int) param.args[3];
-                            if (bottom > 0) {
-                                log("zeroing KeyboardHolder bottom padding, was=" + bottom);
-                                param.args[3] = 0;
-                            }
-                        }
                     }
                 }
         );
@@ -270,14 +256,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
                             int bottom = (int) param.args[3];
                             if (bottom > 0) {
-                                param.args[3] = 0;
-                            }
-                        }
-                        if (isKeyboardHolder(v)) {
-                            int bottom = (int) param.args[3];
-                            if (bottom > 0) {
-                                log("zeroing KeyboardHolder bottom padding (relative), was="
-                                        + bottom);
                                 param.args[3] = 0;
                             }
                         }
@@ -466,13 +444,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         );
 
         // ============================================================
-        // InputView — главный подозреваемый
+        // ГЛАВНЫЙ ХУК: InputView.onMeasure — схлопываем до высоты ребёнка
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
                     TARGET_VIEW_CLASS, false, lpparam.classLoader);
 
-            // 1. onMeasure — после super, если padB > 0 — зануляем
             XposedHelpers.findAndHookMethod(
                     inputViewClass,
                     "onMeasure",
@@ -481,18 +458,54 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             View v = (View) param.thisObject;
-                            int h = v.getMeasuredHeight();
+                            if (!(v instanceof ViewGroup)) return;
+                            ViewGroup vg = (ViewGroup) v;
+
+                            int superH = v.getMeasuredHeight();
+                            int superW = v.getMeasuredWidth();
                             int padB = v.getPaddingBottom();
-                            log("InputView.onMeasure: mh=" + h + ", padB=" + padB);
+
                             if (padB > 0) {
                                 v.setPadding(v.getPaddingLeft(), v.getPaddingTop(),
                                              v.getPaddingRight(), 0);
+                            }
+
+                            // Ищем высоту самого высокого видимого ребёнка
+                            int childH = 0;
+                            for (int i = 0; i < vg.getChildCount(); i++) {
+                                View child = vg.getChildAt(i);
+                                if (child.getVisibility() == View.GONE) continue;
+                                int ch = child.getMeasuredHeight();
+                                if (ch > childH) {
+                                    childH = ch;
+                                }
+                            }
+
+                            if (childH > 0 && childH != superH) {
+                                log("InputView.onMeasure: superH=" + superH
+                                        + " → shrink to childH=" + childH
+                                        + " (padB was " + padB + ")");
+                                v.setMeasuredDimension(superW, childH);
+                            } else {
+                                log("InputView.onMeasure: superH=" + superH
+                                        + ", childH=" + childH + " (no shrink)");
                             }
                         }
                     }
             );
 
-            // 2. onLayout — после super логируем
+            log("hooked InputView.onMeasure (shrink to child)");
+        } catch (Throwable t) {
+            log("failed to hook InputView.onMeasure: " + t);
+        }
+
+        // ============================================================
+        // InputView.onLayout — после super, если h > child, схлопнуть
+        // ============================================================
+        try {
+            Class<?> inputViewClass = Class.forName(
+                    TARGET_VIEW_CLASS, false, lpparam.classLoader);
+
             XposedHelpers.findAndHookMethod(
                     inputViewClass,
                     "onLayout",
@@ -507,14 +520,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         }
                     }
             );
-
-            log("hooked InputView.onMeasure + onLayout");
         } catch (Throwable t) {
-            log("failed to hook InputView: " + t);
+            log("failed to hook InputView.onLayout: " + t);
         }
 
         // ============================================================
-        // LinearLayout (h=541) — родитель KeyboardHolder
+        // LinearLayout (h=541) — логируем на всякий случай
         // ============================================================
         XposedHelpers.findAndHookMethod(
                 android.widget.LinearLayout.class,
@@ -529,172 +540,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             log("LinearLayout.onMeasure: mh=" + h
                                     + ", padB=" + v.getPaddingBottom()
                                     + ", id=" + safeResName(v));
-                            if (v.getPaddingBottom() > 0) {
-                                v.setPadding(v.getPaddingLeft(), v.getPaddingTop(),
-                                             v.getPaddingRight(), 0);
-                            }
                         }
                     }
                 }
         );
-
-        // ============================================================
-        // KeyboardHolder — родитель клавиатуры
-        // ============================================================
-        try {
-            Class<?> khClass = Class.forName(KEYBOARD_HOLDER_CLASS, false, lpparam.classLoader);
-
-            XposedHelpers.findAndHookMethod(
-                    khClass,
-                    "onMeasure",
-                    int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            View v = (View) param.thisObject;
-                            log("KeyboardHolder.onMeasure result h=" + v.getMeasuredHeight()
-                                    + ", width=" + v.getMeasuredWidth());
-                        }
-                    }
-            );
-
-            XposedHelpers.findAndHookMethod(
-                    khClass,
-                    "setLayoutParams",
-                    ViewGroup.LayoutParams.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            ViewGroup.LayoutParams lp =
-                                    (ViewGroup.LayoutParams) param.args[0];
-                            if (lp != null && lp.height > 0) {
-                                log("KeyboardHolder.LayoutParams.height → 0, was=" + lp.height);
-                                lp.height = 0;
-                            }
-                        }
-                    }
-            );
-
-            log("hooked KeyboardHolder");
-        } catch (Throwable t) {
-            log("failed to hook KeyboardHolder: " + t);
-        }
-
-        // ============================================================
-        // CopyImageSourceView — оставляем на всякий случай
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "onLayout",
-                    boolean.class, int.class, int.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            View v = (View) param.thisObject;
-                            if (!isCopyImageSrc(v)) return;
-                            if (v.getHeight() != 0) {
-                                v.layout(v.getLeft(), v.getTop(),
-                                         v.getRight(), v.getTop());
-                            }
-                        }
-                    }
-            );
-        } catch (Throwable t) {
-            log("failed to hook CopyImageSourceView onLayout: " + t);
-        }
-
-        // ============================================================
-        // ДАМП (отключён по умолчанию)
-        // ============================================================
-        if (USE_CHAIN_DUMP) {
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "onLayout",
-                    boolean.class, int.class, int.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                View v = (View) param.thisObject;
-                                String cls = v.getClass().getName();
-                                if (cls.contains("KeyboardHolder")
-                                        || cls.contains("InputView")
-                                        || cls.endsWith("SoftKeyboardView")
-                                        || cls.endsWith("ScaledKeyboardViewInner")
-                                        || cls.endsWith("CopyImageSourceView")
-                                        || cls.endsWith("KeyboardViewHolder")) {
-                                    ViewGroup.LayoutParams lp = v.getLayoutParams();
-                                    String lpInfo = lp == null ? "null"
-                                            : ("w=" + lp.width + ",h=" + lp.height);
-                                    log(String.format(
-                                            "CHAIN [%s] h=%d, mh=%d, bottom=%d, top=%d, padB=%d, lp=%s",
-                                            cls,
-                                            v.getHeight(),
-                                            v.getMeasuredHeight(),
-                                            v.getBottom(),
-                                            v.getTop(),
-                                            v.getPaddingBottom(),
-                                            lpInfo));
-                                }
-                            } catch (Throwable t) {
-                            }
-                        }
-                    }
-            );
-        }
-
-        if (USE_NAVBAR_TREE_DUMP) {
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "onLayout",
-                    boolean.class, int.class, int.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                View v = (View) param.thisObject;
-                                int h = v.getHeight();
-                                if (h < 30 || h > 250) return;
-
-                                String cls = v.getClass().getName();
-                                if (cls.contains("inputmethod")
-                                        || cls.contains("latin")
-                                        || cls.contains("widget")
-                                        || cls.contains("nav")
-                                        || cls.contains("keyboard")
-                                        || cls.contains("Keyboard")) {
-
-                                    StringBuilder parents = new StringBuilder();
-                                    android.view.ViewParent p = v.getParent();
-                                    int depth = 0;
-                                    while (p != null && depth < 5) {
-                                        if (p instanceof View) {
-                                            View pv = (View) p;
-                                            parents.append(" ← ")
-                                                   .append(pv.getClass().getSimpleName())
-                                                   .append("(h=").append(pv.getHeight())
-                                                   .append(",id=").append(safeResName(pv))
-                                                   .append(")");
-                                        }
-                                        p = p.getParent();
-                                        depth++;
-                                    }
-
-                                    String tag = String.valueOf(v.getTag());
-                                    if (tag.length() > 40) {
-                                        tag = tag.substring(0, 40) + "...";
-                                    }
-                                    log(String.format(
-                                            "MATCH [cls=%s] h=%d, bottom=%d, tag=%s%s",
-                                            cls, h, v.getBottom(), tag, parents.toString()));
-                                }
-                            } catch (Throwable t) {
-                            }
-                        }
-                    }
-            );
-        }
 
         // ============ Отладка ============
         if (USE_VIEW_FALLBACK_DEBUG_LOGGING) {
