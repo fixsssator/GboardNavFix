@@ -60,7 +60,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             "files/phenotype",
             "files/phenotype_storage_info",
             "files/datastore/flags_jetpack_data_store.pb"
-            // shared_prefs и databases НЕ трогаем — иначе слетит словарь и настройки
     };
 
     private static final String REPURPOSED_TAG = "gboardnavfix_repurposed";
@@ -212,7 +211,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 Drawable.class
         );
 
-        // ============ InputView: setPadding / setPaddingRelative ============
+        // ============ InputView / NavigationBarFrame: setPadding ============
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setPadding",
@@ -228,7 +227,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 param.args[3] = 0;
                             }
                         }
-                        // Заодно ловим NavigationBarFrame на всякий случай
                         if (isNavBarFrame(v)) {
                             int bottom = (int) param.args[3];
                             if (bottom > 0) {
@@ -326,8 +324,15 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         protected void afterHookedMethod(MethodHookParam param) {
                             View v = (View) param.thisObject;
                             if (v.getMeasuredHeight() != 0) {
-                                v.setMeasuredDimension(v.getMeasuredWidth(), 0);
-                                log("forced NavigationBarFrame measuredHeight=0");
+                                try {
+                                    java.lang.reflect.Method m = View.class.getDeclaredMethod(
+                                            "setMeasuredDimension", int.class, int.class);
+                                    m.setAccessible(true);
+                                    m.invoke(v, v.getMeasuredWidth(), 0);
+                                    log("forced NavigationBarFrame measuredHeight=0");
+                                } catch (Throwable t) {
+                                    log("setMeasuredDimension via reflection failed: " + t);
+                                }
                             }
                         }
                     }
