@@ -24,7 +24,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     // Тестовая подпись — 64 hex-символа. Конкретное значение не важно,
     // главное чтобы она ОТЛИЧАЛАСЬ от оригинальной подписи Google.
-    // Именно это ломает server-side эксперимент, который добавляет отступ.
     private static final String FAKE_SIGNATURE_HEX =
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -99,16 +98,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
         log("hooking into Gboard, process=" + lpparam.processName);
 
-        // 1) Чистим Phenotype-кэш на диске
         wipePhenotypeCache();
-
-        // 2) Чистим Phenotype-кэш через GMS
         clearPhenotypeViaGms(lpparam.classLoader);
-
-        // 3) Crash guard
         installCrashGuard();
 
-        // 4) Спуфим versionCode/versionName/подпись
         if (SPOOF_VERSION_TO_DISABLE_EXPERIMENT) {
             XC_MethodHook spoofHook = new XC_MethodHook() {
                 @Override
@@ -143,7 +136,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {}
         }
 
-        // 5) Запоминаем сервис клавиатуры
         try {
             XposedHelpers.findAndHookMethod(
                     InputMethodService.class, "onCreate",
@@ -157,7 +149,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             log("failed to hook InputMethodService.onCreate: " + t);
         }
 
-        // 6) setInputView — зануляем bottom padding
         try {
             XposedHelpers.findAndHookMethod(
                     InputMethodService.class, "setInputView", View.class,
@@ -180,7 +171,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             log("failed to hook setInputView: " + t);
         }
 
-        // 7) Иконка языка
         tryHook(
                 "android.inputmethodservice.navigationbar.KeyButtonView",
                 lpparam.classLoader,
@@ -206,7 +196,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 },
                 Drawable.class);
 
-        // 8) InputView + NavigationBarFrame: setPadding
         XposedHelpers.findAndHookMethod(
                 View.class, "setPadding",
                 int.class, int.class, int.class, int.class,
@@ -248,7 +237,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 });
 
-        // 9) NavigationBarFrame: setMinimumHeight
         XposedHelpers.findAndHookMethod(
                 View.class, "setMinimumHeight", int.class,
                 new XC_MethodHook() {
@@ -265,7 +253,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 });
 
-        // 10) NavigationBarFrame: setLayoutParams
         XposedHelpers.findAndHookMethod(
                 View.class, "setLayoutParams", ViewGroup.LayoutParams.class,
                 new XC_MethodHook() {
@@ -282,7 +269,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 });
 
-        // 11) NavigationBarFrame не переопределяет onMeasure — хукаем View.measure
         XposedHelpers.findAndHookMethod(
                 View.class, "measure", int.class, int.class,
                 new XC_MethodHook() {
@@ -303,13 +289,19 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         View v = (View) param.thisObject;
                         if (!isNavBarFrame(v)) return;
                         if (v.getMeasuredHeight() != 0) {
-                            v.setMeasuredDimension(v.getMeasuredWidth(), 0);
-                            log("forced NavigationBarFrame measuredHeight=0");
+                            try {
+                                java.lang.reflect.Method m = View.class.getDeclaredMethod(
+                                        "setMeasuredDimension", int.class, int.class);
+                                m.setAccessible(true);
+                                m.invoke(v, v.getMeasuredWidth(), 0);
+                                log("forced NavigationBarFrame measuredHeight=0");
+                            } catch (Throwable t) {
+                                log("setMeasuredDimension via reflection failed: " + t);
+                            }
                         }
                     }
                 });
 
-        // 12) Resources: dimen
         XposedHelpers.findAndHookMethod(
                 Resources.class, "getDimensionPixelSize", int.class,
                 new XC_MethodHook() {
@@ -330,7 +322,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 });
 
-        // 13) Скрытие системных кнопок
         XposedHelpers.findAndHookMethod(
                 View.class, "setVisibility", int.class,
                 new XC_MethodHook() {
@@ -407,7 +398,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 });
 
-        // 14) key_pos_switch_to_next_language
         XposedHelpers.findAndHookMethod(
                 View.class, "setContentDescription", CharSequence.class,
                 new XC_MethodHook() {
