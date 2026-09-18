@@ -5,7 +5,6 @@ import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.ViewParent;
 import android.widget.ImageView;
 
 import java.util.Arrays;
@@ -21,12 +20,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Убирает пустой нижний отступ у Gboard на Pixel.
  *
- * Известно: CopyImageSourceView имеет h=103, bottom=103 — spacer внизу.
- * Но он не переопределяет onMeasure/onLayout/setMinimumHeight/setLayoutParams,
- * поэтому хуки через View.class не срабатывают. Нужно найти РОДИТЕЛЯ,
- * который задаёт ему MeasureSpec с высотой 103.
- *
- * Текущая версия: расширенный дамп с цепочкой родителей.
+ * Виновник: com.google.android.libraries.inputmethod.widgets.CopyImageSourceView
+ * с h=103. Высоту задаёт родитель через measureChild/measure, поэтому
+ * перехватываем эти методы и принудительно ставим MeasureSpec.EXACTLY 0.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -447,7 +443,126 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         );
 
         // ============================================================
-        // РАСШИРЕННЫЙ ДАМП С ЦЕПОЧКОЙ РОДИТЕЛЕЙ
+        // ГЛАВНОЕ: перехват момента, когда родитель задаёт высоту
+        // CopyImageSourceView через measureChild / measureChildWithMargins
+        // ============================================================
+
+        // 1. ViewGroup.measureChild
+        try {
+            XposedHelpers.findAndHookMethod(
+                    ViewGroup.class,
+                    "measureChild",
+                    View.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            View child = (View) param.args[0];
+                            if (child == null || !isCopyImageSrc(child)) return;
+                            log("measureChild(CopyImageSourceView) → forcing height=0");
+                            param.args[2] = View.MeasureSpec.makeMeasureSpec(
+                                    0, View.MeasureSpec.EXACTLY);
+                        }
+                    }
+            );
+            log("hooked ViewGroup.measureChild");
+        } catch (Throwable t) {
+            log("failed to hook measureChild: " + t);
+        }
+
+        // 2. ViewGroup.measureChildWithMargins
+        try {
+            XposedHelpers.findAndHookMethod(
+                    ViewGroup.class,
+                    "measureChildWithMargins",
+                    View.class, int.class, int.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            View child = (View) param.args[0];
+                            if (child == null || !isCopyImageSrc(child)) return;
+                            log("measureChildWithMargins(CopyImageSourceView) → forcing height=0");
+                            param.args[3] = View.MeasureSpec.makeMeasureSpec(
+                                    0, View.MeasureSpec.EXACTLY);
+                        }
+                    }
+            );
+            log("hooked ViewGroup.measureChildWithMargins");
+        } catch (Throwable t) {
+            log("failed to hook measureChildWithMargins: " + t);
+        }
+
+        // 3. View.measure — public final, должен найтись
+        try {
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "measure",
+                    int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            if (!isCopyImageSrc(v)) return;
+                            log("View.measure(CopyImageSourceView) → forcing height=0");
+                            param.args[1] = View.MeasureSpec.makeMeasureSpec(
+                                    0, View.MeasureSpec.EXACTLY);
+                        }
+                    }
+            );
+            log("hooked View.measure");
+        } catch (Throwable t) {
+            log("failed to hook View.measure: " + t);
+        }
+
+        // 4. onMeasure через View — на случай, если класс всё же переопределяет
+        try {
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "onMeasure",
+                    int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            if (!isCopyImageSrc(v)) return;
+                            if (v.getMeasuredHeight() != 0) {
+                                v.setMeasuredDimension(v.getMeasuredWidth(), 0);
+                                log("forced CopyImageSourceView measuredHeight=0");
+                            }
+                        }
+                    }
+            );
+            log("hooked View.onMeasure (fallback)");
+        } catch (Throwable t) {
+            log("failed to hook View.onMeasure: " + t);
+        }
+
+        // 5. onLayout — принудительное схлопывание, если всё равно распёрло
+        try {
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "onLayout",
+                    boolean.class, int.class, int.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            if (!isCopyImageSrc(v)) return;
+                            if (v.getHeight() != 0) {
+                                log("CopyImageSourceView.onLayout h=" + v.getHeight()
+                                        + " → collapse");
+                                v.layout(v.getLeft(), v.getTop(),
+                                         v.getRight(), v.getTop());
+                            }
+                        }
+                    }
+            );
+            log("hooked View.onLayout (fallback)");
+        } catch (Throwable t) {
+            log("failed to hook View.onLayout: " + t);
+        }
+
+        // ============================================================
+        // УМНЫЙ ДАМП с цепочкой родителей
         // ============================================================
         if (USE_NAVBAR_TREE_DUMP) {
             XposedHelpers.findAndHookMethod(
@@ -470,14 +585,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                         || cls.contains("keyboard")
                                         || cls.contains("Keyboard")) {
 
-                                    // Собираем цепочку родителей
                                     StringBuilder parents = new StringBuilder();
-                                    ViewParent p = v.getParent();
+                                    android.view.ViewParent p = v.getParent();
                                     int depth = 0;
                                     while (p != null && depth < 5) {
                                         if (p instanceof View) {
                                             View pv = (View) p;
-                                            parents.append(" <- ")
+                                            parents.append(" ← ")
                                                    .append(pv.getClass().getSimpleName())
                                                    .append("(h=").append(pv.getHeight())
                                                    .append(",id=").append(safeResName(pv))
