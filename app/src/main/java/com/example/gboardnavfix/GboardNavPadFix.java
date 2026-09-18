@@ -20,9 +20,16 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Убирает пустой нижний отступ у Gboard на Pixel.
  *
- * Виновник: com.google.android.libraries.inputmethod.widgets.CopyImageSourceView
- * с h=103. Хукаем через onLayout (схлопывание) + дамп с цепочкой родителей,
- * чтобы найти того, кто задаёт высоту.
+ * Диагностика показала цепочку:
+ *   CopyImageSourceView (h=103)
+ *     ← ScaledKeyboardViewInner (h=103)
+ *       ← SoftKeyboardView (h=103)
+ *         ← KeyboardViewHolder (h=103)
+ *           ← KeyboardHolder (h=498)
+ *             ← LinearLayout (h=541)
+ *
+ * Полосу создаёт разница между KeyboardHolder (498) и LinearLayout (541),
+ * плюс InputView paddingBottom=99. Работаем по обоим фронтам.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -37,6 +44,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final String COPY_IMAGE_SRC_CLASS =
             "com.google.android.libraries.inputmethod.widgets.CopyImageSourceView";
+
+    // Класс KeyboardHolder — родитель клавиатуры, у которого h=498
+    private static final String KEYBOARD_HOLDER_CLASS =
+            "com.google.android.libraries.inputmethod.keyboard.impl.KeyboardHolder";
 
     private static final String[] TARGET_DIMEN_NAMES = {
             "navigation_bar_height",
@@ -59,6 +70,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
     private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
     private static final boolean USE_NAVBAR_TREE_DUMP = true;
+    private static final boolean USE_CHAIN_DUMP = true;
 
     private static final String[] PHENOTYPE_CACHE_PATHS = {
             "files/phenotype",
@@ -99,6 +111,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isCopyImageSrc(View v) {
         return COPY_IMAGE_SRC_CLASS.equals(v.getClass().getName());
+    }
+
+    private static boolean isKeyboardHolder(View v) {
+        return KEYBOARD_HOLDER_CLASS.equals(v.getClass().getName());
     }
 
     @Override
@@ -240,6 +256,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 param.args[3] = 0;
                             }
                         }
+                        if (isKeyboardHolder(v)) {
+                            int bottom = (int) param.args[3];
+                            if (bottom > 0) {
+                                log("zeroing KeyboardHolder bottom padding, was=" + bottom);
+                                param.args[3] = 0;
+                            }
+                        }
                     }
                 }
         );
@@ -255,6 +278,14 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
                             int bottom = (int) param.args[3];
                             if (bottom > 0) {
+                                param.args[3] = 0;
+                            }
+                        }
+                        if (isKeyboardHolder(v)) {
+                            int bottom = (int) param.args[3];
+                            if (bottom > 0) {
+                                log("zeroing KeyboardHolder bottom padding (relative), was="
+                                        + bottom);
                                 param.args[3] = 0;
                             }
                         }
@@ -443,8 +474,90 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         );
 
         // ============================================================
-        // CopyImageSourceView: схлопывание через onLayout
+        // KeyboardHolder — родитель клавиатуры, h=498
         // ============================================================
+        try {
+            Class<?> khClass = Class.forName(KEYBOARD_HOLDER_CLASS, false, lpparam.classLoader);
+
+            // 1. onMeasure — после super логируем результат
+            XposedHelpers.findAndHookMethod(
+                    khClass,
+                    "onMeasure",
+                    int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            log("KeyboardHolder.onMeasure result h=" + v.getMeasuredHeight()
+                                    + ", width=" + v.getMeasuredWidth());
+                        }
+                    }
+            );
+
+            // 2. setLayoutParams — зануляем высоту
+            XposedHelpers.findAndHookMethod(
+                    khClass,
+                    "setLayoutParams",
+                    ViewGroup.LayoutParams.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            ViewGroup.LayoutParams lp =
+                                    (ViewGroup.LayoutParams) param.args[0];
+                            if (lp != null && lp.height > 0) {
+                                log("KeyboardHolder.LayoutParams.height → 0, was=" + lp.height);
+                                lp.height = 0;
+                            }
+                        }
+                    }
+            );
+
+            log("hooked KeyboardHolder");
+        } catch (Throwable t) {
+            log("failed to hook KeyboardHolder: " + t);
+        }
+
+        // ============================================================
+        // CopyImageSourceView — цепочка хуков (на всякий случай)
+        // ============================================================
+        try {
+            XposedHelpers.findAndHookMethod(
+                    ViewGroup.class,
+                    "measureChild",
+                    View.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            View child = (View) param.args[0];
+                            if (child == null || !isCopyImageSrc(child)) return;
+                            param.args[2] = View.MeasureSpec.makeMeasureSpec(
+                                    0, View.MeasureSpec.EXACTLY);
+                        }
+                    }
+            );
+        } catch (Throwable t) {
+            log("failed to hook measureChild: " + t);
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                    ViewGroup.class,
+                    "measureChildWithMargins",
+                    View.class, int.class, int.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            View child = (View) param.args[0];
+                            if (child == null || !isCopyImageSrc(child)) return;
+                            param.args[3] = View.MeasureSpec.makeMeasureSpec(
+                                    0, View.MeasureSpec.EXACTLY);
+                        }
+                    }
+            );
+        } catch (Throwable t) {
+            log("failed to hook measureChildWithMargins: " + t);
+        }
+
         try {
             XposedHelpers.findAndHookMethod(
                     View.class,
@@ -464,9 +577,49 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         }
                     }
             );
-            log("hooked View.onLayout for CopyImageSourceView");
         } catch (Throwable t) {
-            log("failed to hook View.onLayout: " + t);
+            log("failed to hook onLayout: " + t);
+        }
+
+        // ============================================================
+        // CHAIN DUMP — высоты всей цепочки до InputView
+        // ============================================================
+        if (USE_CHAIN_DUMP) {
+            XposedHelpers.findAndHookMethod(
+                    View.class,
+                    "onLayout",
+                    boolean.class, int.class, int.class, int.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                View v = (View) param.thisObject;
+                                String cls = v.getClass().getName();
+                                if (cls.contains("KeyboardHolder")
+                                        || cls.contains("InputView")
+                                        || cls.endsWith("SoftKeyboardView")
+                                        || cls.endsWith("ScaledKeyboardViewInner")
+                                        || cls.endsWith("CopyImageSourceView")
+                                        || cls.endsWith("KeyboardViewHolder")) {
+                                    ViewGroup.LayoutParams lp = v.getLayoutParams();
+                                    String lpInfo = lp == null ? "null"
+                                            : ("w=" + lp.width + ",h=" + lp.height);
+                                    log(String.format(
+                                            "CHAIN [%s] h=%d, mh=%d, bottom=%d, top=%d, padB=%d, lp=%s",
+                                            cls,
+                                            v.getHeight(),
+                                            v.getMeasuredHeight(),
+                                            v.getBottom(),
+                                            v.getTop(),
+                                            v.getPaddingBottom(),
+                                            lpInfo));
+                                }
+                            } catch (Throwable t) {
+                            }
+                        }
+                    }
+            );
+            log("CHAIN dump enabled");
         }
 
         // ============================================================
