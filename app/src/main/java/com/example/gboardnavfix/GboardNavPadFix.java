@@ -20,14 +20,14 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Убирает пустой нижний отступ у Gboard на Pixel.
  *
- * Диагностика показала:
+ * Диагностика:
  *   InputView.onMeasure: mh=2205, padB=0
- *   InputView.onLayout: h=2205
  *   LinearLayout (внутри): mh=541
  *
- * InputView растянут на 2205px, а клавиатура внутри — всего 541px.
- * Разница = пустая зона под клавиатурой. Решение: после super.onMeasure
- * схлопываем InputView до высоты его самого высокого видимого ребёнка.
+ * InputView растянут на 2205px, клавиатура внутри — 541px.
+ * Решение: после super.onMeasure схлопываем InputView до высоты
+ * самого высокого видимого ребёнка. setMeasuredDimension вызываем
+ * через рефлексию — он protected в View.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -72,6 +72,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static volatile InputMethodService sImeService;
     private static volatile Drawable sLanguageIconDrawable;
 
+    // Кэшированный Method для setMeasuredDimension (protected в View)
+    private static volatile java.lang.reflect.Method sSetMeasuredDimensionMethod;
+
     private static void tryHook(String className, ClassLoader cl, String methodName,
                                  XC_MethodHook hook, Object... paramTypes) {
         try {
@@ -98,8 +101,20 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         return NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
     }
 
-    private static boolean isInputView(View v) {
-        return TARGET_VIEW_CLASS.equals(v.getClass().getName());
+    // setMeasuredDimension через рефлексию — он protected в View
+    private static void callSetMeasuredDimension(View v, int w, int h) {
+        try {
+            java.lang.reflect.Method m = sSetMeasuredDimensionMethod;
+            if (m == null) {
+                m = View.class.getDeclaredMethod(
+                        "setMeasuredDimension", int.class, int.class);
+                m.setAccessible(true);
+                sSetMeasuredDimensionMethod = m;
+            }
+            m.invoke(v, w, h);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": setMeasuredDimension via reflection failed: " + t);
+        }
     }
 
     @Override
@@ -485,7 +500,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 log("InputView.onMeasure: superH=" + superH
                                         + " → shrink to childH=" + childH
                                         + " (padB was " + padB + ")");
-                                v.setMeasuredDimension(superW, childH);
+                                callSetMeasuredDimension(v, superW, childH);
                             } else {
                                 log("InputView.onMeasure: superH=" + superH
                                         + ", childH=" + childH + " (no shrink)");
@@ -500,7 +515,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         // ============================================================
-        // InputView.onLayout — после super, если h > child, схлопнуть
+        // InputView.onLayout — лог для проверки
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -525,7 +540,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         // ============================================================
-        // LinearLayout (h=541) — логируем на всякий случай
+        // LinearLayout (h=541) — логируем
         // ============================================================
         XposedHelpers.findAndHookMethod(
                 android.widget.LinearLayout.class,
