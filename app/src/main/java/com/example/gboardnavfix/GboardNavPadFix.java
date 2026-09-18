@@ -149,40 +149,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         //     приложение целиком. ---
         installCrashGuard();
 
-        // --- Устраняем гонку "видно один кадр перед тем, как хук видимости
-        //     успевает сработать" (особенно заметно после сна/свежего
-        //     старта процесса). В отличие от прошлой попытки — НЕ пропускаем
-        //     draw() целиком (это ломало canvas для соседей), а оборачиваем
-        //     оригинальный вызов пустым clipRect между save()/restore():
-        //     оригинальный метод всё так же полностью выполняется (со своими
-        //     внутренними save/restore), просто рисует в обрезанную в ноль
-        //     область — визуально невидимо, а состояние canvas для
-        //     последующих соседей остаётся чистым. ---
-        XC_MethodHook clipHideHook = new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                View v = (View) param.thisObject;
-                if (ALWAYS_HIDDEN_IDS.contains(safeResName(v))) {
-                    android.graphics.Canvas c = (android.graphics.Canvas) param.args[0];
-                    c.save();
-                    c.clipRect(0, 0, 0, 0);
-                }
-            }
-
-            @Override
-            protected void afterHookedMethod(MethodHookParam param) {
-                View v = (View) param.thisObject;
-                if (ALWAYS_HIDDEN_IDS.contains(safeResName(v))) {
-                    android.graphics.Canvas c = (android.graphics.Canvas) param.args[0];
-                    c.restore();
-                }
-            }
-        };
-        tryHook("android.inputmethodservice.navigationbar.KeyButtonView",
-                lpparam.classLoader, "draw", clipHideHook, android.graphics.Canvas.class);
-        tryHook("android.inputmethodservice.navigationbar.NavigationHandle",
-                lpparam.classLoader, "draw", clipHideHook, android.graphics.Canvas.class);
-
         // --- ТЕОРИЯ: server-side experiment-флаги (Phenotype/GServices)
         //     привязаны к конкретному versionCode/подписи APK. Когда юзер
         //     пересобирает Gboard под другой версией — флаг "спрячь родную
