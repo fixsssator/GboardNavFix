@@ -23,24 +23,18 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Настоящий виновник найден через smart onLayout dump:
  *   com.google.android.libraries.inputmethod.widgets.CopyImageSourceView
  *   с h=103, bottom=103 — это spacer внизу клавиатуры.
- *
- * Плюс: спуфинг versionCode/versionName/подписи для отключения
- * server-side эксперимента Gboard.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final String TAG = "GboardNavFix";
     private static final String GBOARD_PKG = "com.google.android.inputmethod.latin";
 
-    // Корневой view клавиатуры (bottom padding = 99)
     private static final String TARGET_VIEW_CLASS =
             "com.google.android.libraries.inputmethod.inputview.InputView";
 
-    // Системный контейнер IME nav bar
     private static final String NAV_BAR_FRAME_CLASS =
             "android.inputmethodservice.navigationbar.NavigationBarFrame";
 
-    // НАСТОЯЩИЙ ВИНОВНИК — spacer внизу клавиатуры
     private static final String COPY_IMAGE_SRC_CLASS =
             "com.google.android.libraries.inputmethod.widgets.CopyImageSourceView";
 
@@ -101,10 +95,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isNavBarFrame(View v) {
         return NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
-    }
-
-    private static boolean isCopyImageSrc(View v) {
-        return COPY_IMAGE_SRC_CLASS.equals(v.getClass().getName());
     }
 
     @Override
@@ -471,7 +461,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
             );
 
-            // 2. onMeasure — принудительно высота 0
+            // 2. onMeasure — принудительно MeasureSpec.EXACTLY 0 (без setMeasuredDimension)
             XposedHelpers.findAndHookMethod(
                     copyCls,
                     "onMeasure",
@@ -481,15 +471,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         protected void beforeHookedMethod(MethodHookParam param) {
                             param.args[1] = View.MeasureSpec.makeMeasureSpec(
                                     0, View.MeasureSpec.EXACTLY);
-                        }
-
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            View v = (View) param.thisObject;
-                            if (v.getMeasuredHeight() != 0) {
-                                v.setMeasuredDimension(v.getMeasuredWidth(), 0);
-                                log("forced CopyImageSourceView measuredHeight=0");
-                            }
                         }
                     }
             );
