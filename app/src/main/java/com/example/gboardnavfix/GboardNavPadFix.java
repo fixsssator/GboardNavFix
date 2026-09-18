@@ -5,6 +5,7 @@ import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.widget.ImageView;
 
 import java.util.Arrays;
@@ -20,9 +21,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Убирает пустой нижний отступ у Gboard на Pixel.
  *
- * Настоящий виновник найден через smart onLayout dump:
- *   com.google.android.libraries.inputmethod.widgets.CopyImageSourceView
- *   с h=103, bottom=103 — это spacer внизу клавиатуры.
+ * Известно: CopyImageSourceView имеет h=103, bottom=103 — spacer внизу.
+ * Но он не переопределяет onMeasure/onLayout/setMinimumHeight/setLayoutParams,
+ * поэтому хуки через View.class не срабатывают. Нужно найти РОДИТЕЛЯ,
+ * который задаёт ему MeasureSpec с высотой 103.
+ *
+ * Текущая версия: расширенный дамп с цепочкой родителей.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -95,6 +99,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isNavBarFrame(View v) {
         return NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
+    }
+
+    private static boolean isCopyImageSrc(View v) {
+        return COPY_IMAGE_SRC_CLASS.equals(v.getClass().getName());
     }
 
     @Override
@@ -439,68 +447,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         );
 
         // ============================================================
-        // ТОЧЕЧНЫЙ ХУК: CopyImageSourceView (h=103, bottom=103)
-        // ============================================================
-        try {
-            Class<?> copyCls = Class.forName(COPY_IMAGE_SRC_CLASS, false, lpparam.classLoader);
-
-            // 1. setMinimumHeight → 0
-            XposedHelpers.findAndHookMethod(
-                    copyCls,
-                    "setMinimumHeight",
-                    int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            int h = (int) param.args[0];
-                            if (h > 0) {
-                                log("CopyImageSourceView.setMinimumHeight → 0, was=" + h);
-                                param.args[0] = 0;
-                            }
-                        }
-                    }
-            );
-
-            // 2. onMeasure — принудительно MeasureSpec.EXACTLY 0 (без setMeasuredDimension)
-            XposedHelpers.findAndHookMethod(
-                    copyCls,
-                    "onMeasure",
-                    int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            param.args[1] = View.MeasureSpec.makeMeasureSpec(
-                                    0, View.MeasureSpec.EXACTLY);
-                        }
-                    }
-            );
-
-            // 3. onLayout — если всё равно распёрло, схлопываем
-            XposedHelpers.findAndHookMethod(
-                    copyCls,
-                    "onLayout",
-                    boolean.class, int.class, int.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            View v = (View) param.thisObject;
-                            if (v.getHeight() != 0) {
-                                log("CopyImageSourceView.onLayout h=" + v.getHeight()
-                                        + " → collapse");
-                                v.layout(v.getLeft(), v.getTop(),
-                                         v.getRight(), v.getTop());
-                            }
-                        }
-                    }
-            );
-
-            log("hooked CopyImageSourceView (точный виновник)");
-        } catch (Throwable t) {
-            log("failed to hook CopyImageSourceView: " + t);
-        }
-
-        // ============================================================
-        // УМНЫЙ ДАМП ДЕРЕВА VIEW по onLayout с фильтром по высоте
+        // РАСШИРЕННЫЙ ДАМП С ЦЕПОЧКОЙ РОДИТЕЛЕЙ
         // ============================================================
         if (USE_NAVBAR_TREE_DUMP) {
             XposedHelpers.findAndHookMethod(
@@ -522,26 +469,38 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                         || cls.contains("nav")
                                         || cls.contains("keyboard")
                                         || cls.contains("Keyboard")) {
+
+                                    // Собираем цепочку родителей
+                                    StringBuilder parents = new StringBuilder();
+                                    ViewParent p = v.getParent();
+                                    int depth = 0;
+                                    while (p != null && depth < 5) {
+                                        if (p instanceof View) {
+                                            View pv = (View) p;
+                                            parents.append(" <- ")
+                                                   .append(pv.getClass().getSimpleName())
+                                                   .append("(h=").append(pv.getHeight())
+                                                   .append(",id=").append(safeResName(pv))
+                                                   .append(")");
+                                        }
+                                        p = p.getParent();
+                                        depth++;
+                                    }
+
                                     String tag = String.valueOf(v.getTag());
-                                    if (tag.length() > 60) {
-                                        tag = tag.substring(0, 60) + "...";
+                                    if (tag.length() > 40) {
+                                        tag = tag.substring(0, 40) + "...";
                                     }
                                     log(String.format(
-                                            "MATCH VIEW [cls=%s] | id=%s | h=%d, minH=%d, vis=%d, bottom=%d, tag=%s",
-                                            cls,
-                                            safeResName(v),
-                                            h,
-                                            v.getMinimumHeight(),
-                                            v.getVisibility(),
-                                            v.getBottom(),
-                                            tag));
+                                            "MATCH [cls=%s] h=%d, bottom=%d, tag=%s%s",
+                                            cls, h, v.getBottom(), tag, parents.toString()));
                                 }
                             } catch (Throwable t) {
                             }
                         }
                     }
             );
-            log("smart onLayout dump enabled");
+            log("smart onLayout dump with parents enabled");
         }
 
         // ============ Отладка ============
