@@ -20,13 +20,6 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Убирает пустой нижний отступ у Gboard, который система резервирует
  * под жестовую навигацию / nav bar.
- *
- * Идея: Gboard не хранит размер этого отступа в собственных (обфусцированных)
- * ресурсах — он читает стандартные системные dimen-ресурсы фреймворка
- * android:dimen/navigation_bar_height и android:dimen/navigation_bar_frame_height.
- * Хук перехватывает Resources.getDimensionPixelSize(int) и обнуляет результат,
- * если запрашиваемый ресурс — один из этих. Скоуп ограничен пакетом Gboard,
- * поэтому на остальную систему (SystemUI и т.д.) это не влияет.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -39,8 +32,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             "com.google.android.libraries.inputmethod.inputview.InputView";
 
     // Имена framework dimen-ресурсов, отвечающих за высоту nav bar
-    // (оставлено на всякий случай — в тестах ни разу не сработало,
-    // Gboard в этой версии берёт значение не отсюда).
     private static final String[] TARGET_DIMEN_NAMES = {
             "navigation_bar_height",
             "navigation_bar_height_landscape",
@@ -48,72 +39,26 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             "navigation_bar_width"
     };
 
-    // Системные кнопки встроенной IME nav bar — скрываем безусловно,
-    // это framework-классы, они всегда одна и та же функция.
+    // Системные кнопки встроенной IME nav bar — скрываем безусловно
     private static final Set<String> ALWAYS_HIDDEN_IDS = new HashSet<>(Arrays.asList(
             "input_method_nav_back",
             "input_method_nav_ime_switcher",
             "input_method_nav_home_handle"
     ));
 
-    // ВАЖНО: этот ID у Gboard переиспользуется под разные функции в
-    // зависимости от контекста поля ввода (иногда это переключатель
-    // языка, а иногда — например в поиске по вкладкам — эмодзи-кнопка).
-    // Поэтому скрываем его ТОЛЬКО когда contentDescription подтверждает,
-    // что это реально язык — иначе рискуем спрятать что-то другое.
+    // ID переиспользуемой кнопки переключения языка / эмодзи
     private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
 
-    // Спуфинг versionCode технически сработал (см. логи), но на UI не
-    // повлиял. НОВАЯ ТЕОРИЯ (после сравнения твоего пересобранного APK
-    // с оригиналом): у пересобранного APK ОБЯЗАТЕЛЬНО меняется ещё и
-    // подпись (apktool не умеет сохранять оригинальную подпись Google) —
-    // возможно, эксперимент завязан именно на подпись, а не на версию.
-    // Пробуем теперь спуфить и её тоже.
     private static final boolean SPOOF_VERSION_TO_DISABLE_EXPERIMENT = true;
-    // Репёрпоз эмодзи-кнопки в языковую НЕ РАБОТАЕТ:
-    // - иконка через рефлексию попадает не в то Drawable-поле (визуально
-    //   "размазывает" кнопку — у SoftKeyView несколько полей-дровяшек:
-    //   фон, ripple, сама иконка, и рефлексия хватает первое попавшееся);
-    // - клик всё равно открывает эмодзи, а не переключает язык — Gboard
-    //   обрабатывает нажатия клавиш НЕ через стандартный OnClickListener/
-    //   performClick, а через свой внутренний touch-механизм, так что
-    //   наша подмена клика не перехватывает реальное действие.
-    // Оставлено выключенным, пока не найден настоящий путь перехвата клика.
     private static final boolean ADD_CUSTOM_GLOBE_BUTTON = false;
 
-    private static void tryHook(String className, ClassLoader cl, String methodName,
-                                 XC_MethodHook hook, Object... paramTypes) {
-        try {
-            Object[] args = Arrays.copyOf(paramTypes, paramTypes.length + 1);
-            args[paramTypes.length] = hook;
-            XposedHelpers.findAndHookMethod(className, cl, methodName, args);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": tryHook failed for " + methodName
-                    + Arrays.toString(paramTypes) + ": " + t);
-        }
-    }
-
-    // Класс системного контейнера IME nav bar — зануляем ему высоту через
-    // LayoutParams при attach (не через onMeasure — тот хук падал с
-    // NoSuchMethodError, класс не переопределяет onMeasure сам).
+    // Класс системного контейнера IME nav bar
     private static final String NAV_BAR_FRAME_CLASS =
             "android.inputmethodservice.navigationbar.NavigationBarFrame";
 
-    // Ссылка на запущенный сервис клавиатуры — нужна, чтобы наша кнопка
-    // "глобус" могла дёрнуть переключение языка тем же системным методом,
-    // которым обычно пользуется сама родная кнопка.
     private static volatile InputMethodService sImeService;
-
-    // Настоящая иконка системной кнопки "Switch input method" — перехватываем
-    // её Drawable до того, как прячем саму кнопку, и переиспользуем в своей.
     private static volatile Drawable sLanguageIconDrawable;
 
-    // Сам контейнер системной IME nav bar. РАНЬШЕ мы прятали и его целиком
-    // (не только дочерние кнопки) — но это ломало попап выбора языка при
-    // долгом нажатии на пробел: попап позиционируется относительно этого
-    // контейнера, а наше периодическое принудительное GONE сбивало его
-    // измерение, и он тут же схлопывался. Поэтому теперь НЕ трогаем
-    // контейнер, только конкретные кнопки внутри него (см. ALWAYS_HIDDEN_IDS).
     private static boolean isAlwaysHidden(View v, String idName) {
         return ALWAYS_HIDDEN_IDS.contains(idName);
     }
@@ -132,31 +77,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
         log("hooking into Gboard, process=" + lpparam.processName);
 
-        // --- Кэш Phenotype-эксперимента переживает наш live-спуфинг: он
-        //     хранится на диске и не всегда перезапрашивается заново. Чистим
-        //     ЕГО (и только его — словарь/эмодзи/история не трогаются) на
-        //     каждом старте процесса, ДО того как Gboard успевает его
-        //     прочитать. Тогда конфиг каждый раз запрашивается заново — уже
-        //     под нашей подменённой identity. ---
+        // --- Чистим кэш Phenotype-эксперимента ---
         wipePhenotypeCache();
 
-        // --- Наш спуфинг подписи (ниже) ломает ДРУГУЮ, отдельную внутреннюю
-        //     проверку Gboard — сверку подписи установленных сплитов/модулей
-        //     с "своей" подписью. Она кидает необработанный IllegalStateException
-        //     на фоновом потоке пула, который валит весь процесс. Не убираем
-        //     сам спуфинг (он и даёт нужный эффект — настоящую кнопку языка),
-        //     а глушим именно это конкретное исключение, чтобы оно не убивало
-        //     приложение целиком. ---
+        // --- Глушим краш подписи сплитов после спуфинга ---
         installCrashGuard();
 
-        // --- ТЕОРИЯ: server-side experiment-флаги (Phenotype/GServices)
-        //     привязаны к конкретному versionCode/подписи APK. Когда юзер
-        //     пересобирает Gboard под другой версией — флаг "спрячь родную
-        //     кнопку языка, покажи вместо неё эмодзи" перестаёт совпадать,
-        //     и приложение откатывается на дефолтное поведение из кода —
-        //     с настоящей кнопкой языка. Подменяем versionCode/versionName
-        //     именно в тот момент, когда Gboard спрашивает PackageManager
-        //     САМ ПРО СЕБЯ (как это обычно делают перед запросом флагов). ---
+        // --- Спуфинг versionCode / versionName / signature ---
         if (SPOOF_VERSION_TO_DISABLE_EXPERIMENT) {
             XC_MethodHook spoofHook = new XC_MethodHook() {
                 @Override
@@ -169,24 +96,15 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         XposedHelpers.setIntField(info, "versionCode", 999999);
                         try {
                             XposedHelpers.setLongField(info, "versionCodeMajor", 0L);
-                        } catch (Throwable ignored) {
-                            // поле есть не на всех версиях API — не критично
-                        }
+                        } catch (Throwable ignored) {}
                         XposedHelpers.setObjectField(info, "versionName", "999.0.0-spoof");
-
-                        // Подмена подписи — имитируем то, что реально происходит
-                        // при пересборке apktool'ом (сертификат меняется на
-                        // отличный от настоящего Google-ключа).
                         spoofSignatureFields(info);
-
                         log("spoofed self versionCode/versionName/signature for " + pkg);
                     } catch (Throwable t) {
                         log("version spoof failed: " + t);
                     }
                 }
             };
-            // Разные сигнатуры getPackageInfo на разных версиях Android —
-            // хукаем какие получится, остальные молча пропускаем.
             tryHook("android.app.ApplicationPackageManager", lpparam.classLoader,
                     "getPackageInfo", spoofHook, String.class, int.class);
             try {
@@ -195,13 +113,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         false, lpparam.classLoader);
                 tryHook("android.app.ApplicationPackageManager", lpparam.classLoader,
                         "getPackageInfo", spoofHook, String.class, flagsClass);
-            } catch (Throwable ignored) {
-                // API < 33, такого перегруза нет — и не надо
-            }
+            } catch (Throwable ignored) {}
         }
 
-    // --- Запоминаем инстанс сервиса клавиатуры — понадобится, чтобы
-        //     наша кнопка "глобус" могла вызвать переключение языка. ---
+        // --- Запоминаем инстанс сервиса клавиатуры ---
         XposedHelpers.findAndHookMethod(
                 InputMethodService.class,
                 "onCreate",
@@ -213,9 +128,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // --- Перехватываем НАСТОЯЩУЮ иконку системной кнопки языка ДО того,
-        //     как мы её прячем — и переиспользуем в своей кнопке вместо
-        //     самодельного рисунка. ---
+        // --- Перехватываем НАСТОЯЩУЮ иконку системной кнопки языка ---
         tryHook(
                 "android.inputmethodservice.navigationbar.KeyButtonView",
                 lpparam.classLoader,
@@ -242,6 +155,47 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 Drawable.class
         );
 
+        // --- Мгновенный перехват рождения дочерних элементов (защита от гонки) ---
+        XposedHelpers.findAndHookMethod(
+                ViewGroup.class,
+                "setOnHierarchyChangeListener",
+                ViewGroup.OnHierarchyChangeListener.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        ViewGroup vg = (ViewGroup) param.thisObject;
+                        String cls = vg.getClass().getName();
+                        if (cls.contains("navigationbar") || cls.contains("inputview")) {
+                            ViewGroup.OnHierarchyChangeListener original =
+                                    (ViewGroup.OnHierarchyChangeListener) param.args[0];
+                            param.args[0] = new ViewGroup.OnHierarchyChangeListener() {
+                                @Override
+                                public void onChildViewAdded(View parent, View child) {
+                                    String idName = safeResName(child);
+                                    if (isAlwaysHidden(child, idName)) {
+                                        child.setVisibility(View.GONE);
+                                        child.setClickable(false);
+                                        child.setFocusable(false);
+                                        log("instant hide on addView (vector): " + idName);
+                                    } else if (LANGUAGE_KEY_ID.equals(idName)
+                                            && isLanguageCd(child.getContentDescription())) {
+                                        if (!SPOOF_VERSION_TO_DISABLE_EXPERIMENT) {
+                                            child.setVisibility(View.GONE);
+                                            log("instant hide language key on addView (vector)");
+                                        }
+                                    }
+                                    if (original != null) original.onChildViewAdded(parent, child);
+                                }
+                                @Override
+                                public void onChildViewRemoved(View parent, View child) {
+                                    if (original != null) original.onChildViewRemoved(parent, child);
+                                }
+                            };
+                        }
+                    }
+                }
+        );
+
         // --- Основной рабочий хук: обнуляем bottom-padding у InputView ---
         XposedHelpers.findAndHookMethod(
                 View.class,
@@ -252,18 +206,17 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
-                            int bottom = (int) param.args[3];
+                            int bottom = (int) param.args;
                             if (bottom > 0) {
                                 log("zeroing InputView bottom padding, was=" + bottom);
-                                param.args[3] = 0;
+                                param.args = 0;
                             }
                         }
                     }
                 }
         );
 
-        // Некоторые View используют setPaddingRelative вместо setPadding —
-        // хукаем и его тем же способом на всякий случай.
+        // setPaddingRelative
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setPaddingRelative",
@@ -273,18 +226,17 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
-                            int bottom = (int) param.args[3];
+                            int bottom = (int) param.args;
                             if (bottom > 0) {
                                 log("zeroing InputView bottom padding (relative), was=" + bottom);
-                                param.args[3] = 0;
+                                param.args = 0;
                             }
                         }
                     }
                 }
         );
 
-        // --- Резервные хуки по имени ресурса (в тестах не срабатывали,
-        //     оставлены на случай других версий Gboard) ---
+        // Резервные хуки getDimensionPixelSize / getDimension
         XposedHelpers.findAndHookMethod(
                 Resources.class,
                 "getDimensionPixelSize",
@@ -313,11 +265,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // --- Скрываем системные элементы встроенной в IME-окно навигационной
-        //     панели: "стрелку назад", "переключатель языка", home-хэндл.
-        //     Хукаем setVisibility() напрямую (а не однократно при создании),
-        //     т.к. система периодически включает их обратно (например,
-        //     "Back" появляется/исчезает в зависимости от контекста). ---
+        // setVisibility()
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setVisibility",
@@ -329,8 +277,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         String idName = safeResName(v);
                         if (isAlwaysHidden(v, idName)) {
                             if ((int) param.args[0] != View.GONE) {
-                                log("forcing GONE on id=" + idName
-                                        + " (was requesting visibility=" + param.args[0] + ")");
+                                log("forcing GONE on id=" + idName);
                                 param.args[0] = View.GONE;
                             }
                         } else if (LANGUAGE_KEY_ID.equals(idName)
@@ -343,10 +290,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // --- Блокируем сам клик по скрываемым кнопкам, независимо от того,
-        //     успела ли она уже стать GONE к моменту тапа (защита от гонки:
-        //     если пользователь тапнет в долю секунды до сокрытия — "Back"
-        //     всё равно не должен закрывать клавиатуру). ---
+        // performClick
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "performClick",
@@ -367,9 +311,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // Подстраховка: скрываем и сразу при первом setOnClickListener
-        // (на случай если к этому моменту id уже назначен, а первый
-        // setVisibility мог случиться раньше, чем этот хук успел встать).
+        // setOnClickListener подстраховка
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setOnClickListener",
@@ -386,11 +328,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // --- Скрываем системные элементы, которые не ловятся через
-        //     setVisibility() (см. выше) — Android при первичной инфляции
-        //     XML применяет android:visibility напрямую во внутренние флаги
-        //     view, в обход публичного setVisibility(). Поэтому скрываем
-        //     явно здесь, как только view полностью создана и attached. ---
+        // onAttachedToWindow
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "onAttachedToWindow",
@@ -407,14 +345,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             v.setClickable(false);
                             v.setFocusable(false);
                         }
-                        // Вставка отдельной 7-й кнопки больше не используется —
-                        // сдвигала раскладку (см. repurposeAsLanguageKey выше,
-                        // вызывается из хука setContentDescription).
-                        // Зануляем высоту контейнера системной nav bar через
-                        // LayoutParams (не через onMeasure — та версия класса
-                        // не переопределяет onMeasure сама, хук по точной
-                        // сигнатуре падал с NoSuchMethodError). Visibility
-                        // не трогаем — это ломало попап языка ранее.
                         if (NAV_BAR_FRAME_CLASS.equals(v.getClass().getName())) {
                             ViewGroup.LayoutParams lp = v.getLayoutParams();
                             if (lp != null && lp.height != 0) {
@@ -427,14 +357,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // --- Решающая проверка для переиспользуемого слота
-        //     key_pos_switch_to_next_language: скрываем ТОЛЬКО когда
-        //     Gboard сам подтверждает через contentDescription, что в этой
-        //     позиции сейчас реально язык, а не эмодзи или что-то ещё.
-        //     Если там НЕ язык (сейчас — эмодзи) — вместо добавления новой
-        //     7-й кнопки (что сдвигало раскладку) ПЕРЕИСПОЛЬЗУЕМ эту же
-        //     кнопку: подменяем иконку на языковую и клик — на переключение
-        //     языка. Раскладка не трогается вообще. ---
+        // setContentDescription
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setContentDescription",
@@ -447,17 +370,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         if (LANGUAGE_KEY_ID.equals(idName)) {
                             CharSequence cd = (CharSequence) param.args[0];
                             if (isLanguageCd(cd) && !SPOOF_VERSION_TO_DISABLE_EXPERIMENT) {
-                                // Прячем дублирующийся язык ТОЛЬКО если спуфинг
-                                // подписи выключен. Когда спуфинг включён и
-                                // сработал — это и есть настоящая, нужная
-                                // кнопка языка, её как раз надо оставить.
                                 log("hiding language key, cd=\"" + cd + "\"");
                                 v.setVisibility(View.GONE);
                                 v.setClickable(false);
                                 v.setFocusable(false);
                             } else if (isLanguageCd(cd)) {
-                                log("real language key visible (spoof active), keeping it: cd=\""
-                                        + cd + "\"");
+                                log("real language key visible (spoof active): cd=\"" + cd + "\"");
                             } else if (ADD_CUSTOM_GLOBE_BUTTON) {
                                 repurposeAsLanguageKey(v, cd);
                             }
@@ -465,93 +383,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 }
         );
-
-        // --- Отладочное логирование (можно выключить, когда всё заработает) ---
-        if (USE_VIEW_FALLBACK_DEBUG_LOGGING) {
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "setPadding",
-                    int.class, int.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            int bottom = (int) param.args[3];
-                            if (bottom > 0) {
-                                View v = (View) param.thisObject;
-                                log("setPadding bottom=" + bottom
-                                        + " on " + v.getClass().getName());
-                            }
-                        }
-                    }
-            );
-        }
-
-        // --- Отладка для поиска кнопок нижнего тулбара (шеврон "свернуть",
-        //     переключатель языка) по contentDescription — она обычно не
-        //     обфусцирована, в отличие от имён ресурсов/классов. ---
-        if (USE_TOOLBAR_DEBUG_LOGGING) {
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "setContentDescription",
-                    CharSequence.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            CharSequence cd = (CharSequence) param.args[0];
-                            if (cd != null && cd.length() > 0) {
-                                View v = (View) param.thisObject;
-                                log("contentDescription=\"" + cd + "\" on "
-                                        + v.getClass().getName()
-                                        + " id=" + safeResName(v));
-                            }
-                        }
-                    }
-            );
-
-            // Некоторые кнопки не имеют contentDescription, но точно
-            // ImageView с drawable — логируем на всякий случай и их создание.
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "setOnClickListener",
-                    View.OnClickListener.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            View v = (View) param.thisObject;
-                            log("setOnClickListener on " + v.getClass().getName()
-                                    + " id=" + safeResName(v)
-                                    + " cd=" + v.getContentDescription());
-                        }
-                    }
-            );
-        }
-
-        // --- Отладка: полный дамп всех view из пакета
-        //     android.inputmethodservice.navigationbar по мере их attach —
-        //     на случай, если останется что-то ещё не учтённое. ---
-        if (USE_NAVBAR_TREE_DUMP) {
-            XposedHelpers.findAndHookMethod(
-                    View.class,
-                    "onAttachedToWindow",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            View v = (View) param.thisObject;
-                            String cls = v.getClass().getName();
-                            if (cls.startsWith("android.inputmethodservice.navigationbar")) {
-                                log("navbar-tree: class=" + cls
-                                        + " id=" + safeResName(v)
-                                        + " visibility=" + v.getVisibility()
-                                        + " cd=" + v.getContentDescription());
-                            }
-                        }
-                    }
-            );
-        }
     }
 
-    // Пути внутри /data/data/<pkg>/, где Gboard хранит кэш решения
-    // эксперимента Phenotype между запусками.
     private static final String[] PHENOTYPE_CACHE_PATHS = {
             "files/phenotype",
             "files/phenotype_storage_info",
@@ -595,13 +428,11 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     if (isSelfInflictedSignatureCrash(e)) {
                         log("suppressed self-inflicted signature-check crash on thread "
                                 + t.getName() + ": " + e);
-                        return; // глушим — не даём убить процесс
+                        return;
                     }
                     if (original != null) {
                         original.uncaughtException(t, e);
                     } else {
-                        // на всякий случай — иначе поток просто зависнет,
-                        // а не завершится штатно
                         System.exit(1);
                     }
                 }
@@ -633,21 +464,14 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                             + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             );
-            // Старое поле (pre-API28) — прямой массив подписей на PackageInfo.
             try {
                 XposedHelpers.setObjectField(packageInfo, "signatures",
                         new android.content.pm.Signature[]{dummy});
-            } catch (Throwable ignored) {
-            }
-            // Новое поле (API 28+) — PackageInfo.signingInfo оборачивает
-            // SigningDetails/SigningInfo с подписями внутри. Структура
-            // менялась между версиями Android, поэтому патчим рекурсивно
-            // любые поля типа Signature/Signature[] на глубину до 3 уровней.
+            } catch (Throwable ignored) {}
             try {
                 Object signingInfo = XposedHelpers.getObjectField(packageInfo, "signingInfo");
                 patchSignaturesRecursively(signingInfo, dummy, 3);
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) {}
         } catch (Throwable t) {
             log("spoofSignatureFields failed: " + t);
         }
@@ -671,21 +495,11 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             patchSignaturesRecursively(nested, dummy, depth - 1);
                         }
                     }
-                } catch (Throwable ignored) {
-                    // пробуем следующее поле
-                }
+                } catch (Throwable ignored) {}
             }
             cls = cls.getSuperclass();
         }
     }
-
-    // Включи, если после скрытия известных ID всё ещё что-то видно —
-    // покажет полное дерево системной IME nav bar.
-    private static final boolean USE_NAVBAR_TREE_DUMP = false;
-
-    // Включи, чтобы найти кнопки нижнего тулбара (шеврон/язык) через logcat.
-    private static final boolean USE_TOOLBAR_DEBUG_LOGGING = false;
-
 
     private String safeResName(View v) {
         try {
@@ -701,8 +515,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private void repurposeAsLanguageKey(View v, CharSequence originalCd) {
         try {
-            if (REPURPOSED_TAG.equals(v.getTag())) return; // уже сделали
-            if (sLanguageIconDrawable == null) return; // иконку ещё не перехватили
+            if (REPURPOSED_TAG.equals(v.getTag())) return;
+            if (sLanguageIconDrawable == null) return;
 
             boolean iconSet = false;
             if (v instanceof ImageView) {
@@ -716,8 +530,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     log("repurpose: setImageDrawable failed: " + t);
                 }
             } else {
-                // SoftKeyView — не ImageView, ищем поле типа Drawable
-                // рефлексией и подменяем его напрямую.
                 iconSet = trySetDrawableField(v);
             }
 
@@ -735,8 +547,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
             });
             v.setTag(REPURPOSED_TAG);
-            log("repurposed emoji-slot key as language switch, iconSet=" + iconSet
-                    + " class=" + v.getClass().getName() + " originalCd=\"" + originalCd + "\"");
+            log("repurposed emoji-slot key as language switch, iconSet=" + iconSet);
         } catch (Throwable t) {
             log("repurposeAsLanguageKey failed: " + t);
         }
@@ -754,12 +565,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 : sLanguageIconDrawable;
                         f.set(v, fresh);
                         v.invalidate();
-                        log("repurpose: set drawable field '" + f.getName()
-                                + "' on " + cls.getName());
                         return true;
-                    } catch (Throwable ignored) {
-                        // пробуем следующее поле
-                    }
+                    } catch (Throwable ignored) {}
                 }
             }
             cls = cls.getSuperclass();
@@ -767,9 +574,16 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         return false;
     }
 
-    // Переключи в true и пересобери, если нужен режим отладки для поиска
-    // класса/значения вручную через logcat (adb logcat | grep GboardNavFix).
-    private static final boolean USE_VIEW_FALLBACK_DEBUG_LOGGING = false;
+    private static void tryHook(String className, ClassLoader cl, String methodName,
+                                XC_MethodHook hook, Object... paramTypes) {
+        try {
+            Object[] args = Arrays.copyOf(paramTypes, paramTypes.length + 1);
+            args[paramTypes.length] = hook;
+            XposedHelpers.findAndHookMethod(className, cl, methodName, args);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "[vector]: tryHook failed for " + methodName + ": " + t);
+        }
+    }
 
     private void maybeZeroOut(XC_MethodHook.MethodHookParam param) {
         int resId = (int) param.args[0];
@@ -785,17 +599,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             String name = res.getResourceEntryName(resId);
             if (name == null) return false;
             for (String target : TARGET_DIMEN_NAMES) {
-                if (target.equals(name)) {
-                    return true;
-                }
+                if (target.equals(name)) return true;
             }
-        } catch (Resources.NotFoundException ignored) {
-            // resId мог быть не ресурсом (например, произвольное число) — игнорируем
-        }
+        } catch (Resources.NotFoundException ignored) {}
         return false;
     }
 
     private void log(String msg) {
-        XposedBridge.log(TAG + ": " + msg);
+        XposedBridge.log(String.format("[%s][vector] %s", TAG, msg));
     }
 }
