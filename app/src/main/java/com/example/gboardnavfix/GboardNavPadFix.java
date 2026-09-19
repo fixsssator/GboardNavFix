@@ -5,6 +5,7 @@ import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.ImageView;
@@ -21,7 +22,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
  * Убирает пустой нижний отступ (~99px) у Gboard на Pixel (gesture navigation).
- * Главный виновник — NavigationBarFrame, который добавляет InputMethodService.
+ * Главный виновник — NavigationBarFrame + insets от InputMethodService.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -95,36 +96,44 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private void forceZeroNavBarFrame(View v) {
         if (v == null) return;
         try {
-            // Самое важное — полностью убрать из layout
+            // 1. Полностью удаляем из родителя
+            ViewParent parent = v.getParent();
+            if (parent instanceof ViewGroup) {
+                ((ViewGroup) parent).removeView(v);
+                log("NavigationBarFrame REMOVED from parent");
+            }
+
+            // 2. Делаем невидимым и нулевым
             v.setVisibility(View.GONE);
             v.setMinimumHeight(0);
 
             ViewGroup.LayoutParams lp = v.getLayoutParams();
             if (lp != null) {
-                if (lp.height != 0) {
-                    lp.height = 0;
+                lp.height = 0;
+                try {
                     v.setLayoutParams(lp);
-                }
+                } catch (Throwable ignored) {}
             }
 
             v.setClickable(false);
             v.setFocusable(false);
             v.setEnabled(false);
 
-            // На всякий случай ещё раз через post
+            // 3. Повторяем (контроллер часто возвращает фрейм)
             v.post(() -> {
                 try {
+                    ViewParent p2 = v.getParent();
+                    if (p2 instanceof ViewGroup) {
+                        ((ViewGroup) p2).removeView(v);
+                    }
                     v.setVisibility(View.GONE);
                     v.setMinimumHeight(0);
-                    ViewGroup.LayoutParams lp2 = v.getLayoutParams();
-                    if (lp2 != null && lp2.height != 0) {
-                        lp2.height = 0;
-                        v.setLayoutParams(lp2);
-                    }
                 } catch (Throwable ignored) {}
             });
+            v.postDelayed(() -> forceZeroNavBarFrame(v), 40);
+            v.postDelayed(() -> forceZeroNavBarFrame(v), 150);
+            v.postDelayed(() -> forceZeroNavBarFrame(v), 400);
 
-            log("forceZeroNavBarFrame: visibility=GONE, height=0");
         } catch (Throwable t) {
             log("forceZeroNavBarFrame failed: " + t);
         }
@@ -195,7 +204,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             log("failed to hook InputMethodService.onCreate: " + t);
         }
 
-        // ============ setInputView + дамп окна ============
+        // ============ setInputView + дамп + hide captionBar ============
         try {
             XposedHelpers.findAndHookMethod(
                     InputMethodService.class,
@@ -228,21 +237,39 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                     log("IME window is null");
                                     return;
                                 }
+
                                 WindowManager.LayoutParams lp = window.getAttributes();
-                                if (lp == null) {
-                                    log("IME window LP is null");
-                                    return;
+                                if (lp != null) {
+                                    log("IME window LP: h=" + lp.height
+                                            + ", w=" + lp.width
+                                            + ", x=" + lp.x
+                                            + ", y=" + lp.y
+                                            + ", gravity=" + lp.gravity
+                                            + ", flags=0x" + Integer.toHexString(lp.flags)
+                                            + ", softInputMode=0x"
+                                            + Integer.toHexString(lp.softInputMode));
                                 }
-                                log("IME window LP: h=" + lp.height
-                                        + ", w=" + lp.width
-                                        + ", x=" + lp.x
-                                        + ", y=" + lp.y
-                                        + ", gravity=" + lp.gravity
-                                        + ", flags=0x" + Integer.toHexString(lp.flags)
-                                        + ", softInputMode=0x"
-                                        + Integer.toHexString(lp.softInputMode));
+
+                                // Пытаемся скрыть captionBar (IME navigation bar)
+                                View decor = window.getDecorView();
+                                if (decor != null) {
+                                    try {
+                                        Object controller = XposedHelpers.callMethod(
+                                                decor, "getWindowInsetsController");
+                                        if (controller != null) {
+                                            Class<?> typeClass = Class.forName(
+                                                    "android.view.WindowInsets$Type");
+                                            int captionBar = XposedHelpers.getStaticIntField(
+                                                    typeClass, "captionBar");
+                                            XposedHelpers.callMethod(controller, "hide", captionBar);
+                                            log("requested hide captionBar via WindowInsetsController");
+                                        }
+                                    } catch (Throwable t) {
+                                        log("hide captionBar failed: " + t);
+                                    }
+                                }
                             } catch (Throwable t) {
-                                log("failed to read window LP: " + t);
+                                log("failed to process window after setInputView: " + t);
                             }
                         }
                     }
@@ -277,6 +304,44 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             log("failed to hook Window.setAttributes: " + t);
         }
 
+        // ============ onComputeInsets — принудительно убираем место под NavBar ============
+        try {
+            XposedHelpers.findAndHookMethod(
+                    InputMethodService.class,
+                    "onComputeInsets",
+                    InputMethodService.Insets.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            InputMethodService.Insets insets =
+                                    (InputMethodService.Insets) param.args[0];
+                            InputMethodService svc = (InputMethodService) param.thisObject;
+
+                            try {
+                                View inputFrame = (View) XposedHelpers.getObjectField(
+                                        svc, "mInputFrame");
+                                if (inputFrame != null
+                                        && inputFrame.getVisibility() == View.VISIBLE) {
+                                    int[] loc = new int[2];
+                                    inputFrame.getLocationInWindow(loc);
+                                    int contentTop = loc[1];
+
+                                    insets.contentTopInsets = contentTop;
+                                    insets.visibleTopInsets = contentTop;
+
+                                    log("onComputeInsets forced: contentTop=" + contentTop);
+                                }
+                            } catch (Throwable t) {
+                                log("onComputeInsets force failed: " + t);
+                            }
+                        }
+                    }
+            );
+            log("hooked onComputeInsets (force)");
+        } catch (Throwable t) {
+            log("failed to hook onComputeInsets: " + t);
+        }
+
         // ============ Иконка языка ============
         tryHook(
                 "android.inputmethodservice.navigationbar.KeyButtonView",
@@ -304,7 +369,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 Drawable.class
         );
 
-        // ============ setPadding / setPaddingRelative (InputView + NavBarFrame) ============
+        // ============ setPadding / setPaddingRelative ============
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setPadding",
@@ -348,9 +413,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // ============ NavigationBarFrame — главное исправление ============
+        // ============ NavigationBarFrame — главное ============
 
-        // setMinimumHeight
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setMinimumHeight",
@@ -359,18 +423,14 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
-                        if (isNavBarFrame(v)) {
-                            int h = (int) param.args[0];
-                            if (h > 0) {
-                                log("zeroing NavigationBarFrame minimumHeight, was=" + h);
-                                param.args[0] = 0;
-                            }
+                        if (isNavBarFrame(v) && (int) param.args[0] > 0) {
+                            log("zeroing NavigationBarFrame minimumHeight, was=" + param.args[0]);
+                            param.args[0] = 0;
                         }
                     }
                 }
         );
 
-        // setLayoutParams
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setLayoutParams",
@@ -392,7 +452,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // setVisibility — всегда GONE
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setVisibility",
@@ -411,7 +470,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // onAttachedToWindow + повторные force
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "onAttachedToWindow",
@@ -421,11 +479,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         View v = (View) param.thisObject;
                         if (isNavBarFrame(v)) {
                             forceZeroNavBarFrame(v);
-                            // Контроллер часто перезаписывает позже — повторяем
-                            v.post(() -> forceZeroNavBarFrame(v));
-                            v.postDelayed(() -> forceZeroNavBarFrame(v), 30);
-                            v.postDelayed(() -> forceZeroNavBarFrame(v), 100);
-                            v.postDelayed(() -> forceZeroNavBarFrame(v), 300);
                         }
                     }
                 }
@@ -543,7 +596,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 }
         );
 
-        // ============ Диагностика InputView (можно оставить) ============
+        // ============ Диагностика InputView ============
         try {
             Class<?> inputViewClass = Class.forName(
                     TARGET_VIEW_CLASS, false, lpparam.classLoader);
@@ -597,8 +650,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             View v = (View) param.thisObject;
                             if (!(v instanceof ViewGroup)) return;
                             ViewGroup vg = (ViewGroup) v;
-                            int containerH = v.getHeight();
-                            log("InputView.onLayout: h=" + containerH
+                            log("InputView.onLayout: h=" + v.getHeight()
                                     + ", padB=" + v.getPaddingBottom()
                                     + ", children=" + vg.getChildCount());
                             for (int i = 0; i < vg.getChildCount(); i++) {
@@ -612,17 +664,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         }
                     }
             );
-            log("hooked InputView.onMeasure/onLayout (диагностика)");
+            log("hooked InputView.onMeasure/onLayout");
         } catch (Throwable t) {
             log("failed to hook InputView measure/layout: " + t);
-        }
-
-        // ============ Отладка (опционально) ============
-        if (USE_VIEW_FALLBACK_DEBUG_LOGGING) {
-            // ... оставьте как было, если нужно
-        }
-        if (USE_TOOLBAR_DEBUG_LOGGING) {
-            // ... оставьте как было
         }
     }
 
