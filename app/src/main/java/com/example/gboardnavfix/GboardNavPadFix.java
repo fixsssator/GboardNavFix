@@ -24,8 +24,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   InputView = 2205, padT=0, padB=0
  *   child[0] FrameLayout = 541, grav=80 (BOTTOM)
  *
- * Ребёнок уже прижат к низу. Пустая зона под ним — часть ОКНА IME,
- * которое выше InputView. Решение: растянуть InputView на всю высоту окна.
+ * Пустая зона под клавиатурой — часть ОКНА IME, которое выше InputView.
+ * Растягиваем InputView до размера MeasureSpec (size из окна).
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -94,10 +94,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isNavBarFrame(View v) {
         return NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
-    }
-
-    private static boolean isInputView(View v) {
-        return TARGET_VIEW_CLASS.equals(v.getClass().getName());
     }
 
     @Override
@@ -445,6 +441,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         // ГЛАВНЫЙ ХУК: InputView.onMeasure
         // 1) зануляем paddingTop/Bottom
         // 2) если MeasureSpec EXACTLY и size > mh — растягиваем до size
+        //    (setMeasuredDimension — protected, вызываем через XposedHelpers)
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -503,7 +500,22 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                     && size > mh
                                     && size > 0) {
                                 log("InputView: stretch " + mh + " → " + size);
-                                v.setMeasuredDimension(v.getMeasuredWidth(), size);
+                                try {
+                                    XposedHelpers.callMethod(v, "setMeasuredDimension",
+                                            v.getMeasuredWidth(), size);
+                                } catch (Throwable t) {
+                                    log("setMeasuredDimension (callMethod) failed: " + t);
+                                    try {
+                                        java.lang.reflect.Method m = View.class
+                                                .getDeclaredMethod("setMeasuredDimension",
+                                                        int.class, int.class);
+                                        m.setAccessible(true);
+                                        m.invoke(v, v.getMeasuredWidth(), size);
+                                        log("InputView: stretch (reflection) OK");
+                                    } catch (Throwable t2) {
+                                        log("setMeasuredDimension (reflection) failed: " + t2);
+                                    }
+                                }
                             }
                         }
                     }
