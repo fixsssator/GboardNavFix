@@ -5,6 +5,8 @@ import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
 import android.widget.ImageView;
 
 import java.util.Arrays;
@@ -20,12 +22,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Убирает пустой нижний отступ у Gboard на Pixel.
  *
- * Диагностика показала:
- *   InputView = 2205, padT=0, padB=0
- *   child[0] FrameLayout = 541, grav=80 (BOTTOM)
+ * Диагностика:
+ *   InputView.onMeasure: mh=2205, spec mode=AT_MOST, size=2205, padT=0, padB=0
+ *   child[0] FrameLayout mh=541, grav=80 (BOTTOM)
+ *   child top=1664, bottom=2205
  *
- * Пустая зона под клавиатурой — часть ОКНА IME, которое выше InputView.
- * Растягиваем InputView до размера MeasureSpec (size из окна).
+ * InputView заполнен полностью, клавиатура прижата к низу. Значит 99px —
+ * это НЕ внутри InputView, а часть окна IME. Смотрим LayoutParams окна.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -158,6 +161,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             log("failed to hook InputMethodService.onCreate: " + t);
         }
 
+        // ============ setInputView + дамп LayoutParams окна ============
         try {
             XposedHelpers.findAndHookMethod(
                     InputMethodService.class,
@@ -180,8 +184,36 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 }
                             }
                         }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            InputMethodService svc = (InputMethodService) param.thisObject;
+                            try {
+                                Window window = svc.getWindow().getWindow();
+                                if (window == null) {
+                                    log("IME window is null");
+                                    return;
+                                }
+                                WindowManager.LayoutParams lp = window.getAttributes();
+                                if (lp == null) {
+                                    log("IME window LP is null");
+                                    return;
+                                }
+                                log("IME window LP: h=" + lp.height
+                                        + ", w=" + lp.width
+                                        + ", x=" + lp.x
+                                        + ", y=" + lp.y
+                                        + ", gravity=" + lp.gravity
+                                        + ", flags=0x" + Integer.toHexString(lp.flags)
+                                        + ", softInputMode=0x"
+                                        + Integer.toHexString(lp.softInputMode));
+                            } catch (Throwable t) {
+                                log("failed to read window LP: " + t);
+                            }
+                        }
                     }
             );
+            log("hooked setInputView (window LP dump)");
         } catch (Throwable t) {
             log("failed to hook setInputView: " + t);
         }
@@ -225,7 +257,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
                             int bottom = (int) param.args[3];
                             if (bottom > 0) {
-                                log("InputView padding: zeroing bottom, was=" + bottom);
+                                log("zeroing InputView bottom padding, was=" + bottom);
                                 param.args[3] = 0;
                             }
                         }
@@ -438,10 +470,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         );
 
         // ============================================================
-        // ГЛАВНЫЙ ХУК: InputView.onMeasure
-        // 1) зануляем paddingTop/Bottom
-        // 2) если MeasureSpec EXACTLY и size > mh — растягиваем до size
-        //    (setMeasuredDimension — protected, вызываем через XposedHelpers)
+        // InputView.onMeasure — ДИАГНОСТИКА (без схлопывания)
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -458,22 +487,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             if (!(v instanceof ViewGroup)) return;
                             ViewGroup vg = (ViewGroup) v;
 
-                            // 1) Зануляем padding
-                            int pt = v.getPaddingTop();
-                            int pb = v.getPaddingBottom();
-                            if (pt != 0 || pb != 0) {
-                                v.setPadding(v.getPaddingLeft(), 0,
-                                             v.getPaddingRight(), 0);
-                            }
-
-                            // 2) Смотрим MeasureSpec
                             int hSpec = (int) param.args[1];
                             int mode = View.MeasureSpec.getMode(hSpec);
                             int size = View.MeasureSpec.getSize(hSpec);
-                            int mh = v.getMeasuredHeight();
 
-                            log("InputView.onMeasure: mh=" + mh
-                                    + ", spec mode=" + mode + ", size=" + size
+                            log("InputView.onMeasure: mh=" + v.getMeasuredHeight()
+                                    + ", spec mode=" + mode
+                                    + ", size=" + size
                                     + ", padT=" + v.getPaddingTop()
                                     + ", padB=" + v.getPaddingBottom()
                                     + ", children=" + vg.getChildCount());
@@ -494,40 +514,17 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                         + " mh=" + child.getMeasuredHeight()
                                         + " grav=" + grav);
                             }
-
-                            // 3) Если MeasureSpec EXACTLY и size больше mh — растягиваем
-                            if (mode == View.MeasureSpec.EXACTLY
-                                    && size > mh
-                                    && size > 0) {
-                                log("InputView: stretch " + mh + " → " + size);
-                                try {
-                                    XposedHelpers.callMethod(v, "setMeasuredDimension",
-                                            v.getMeasuredWidth(), size);
-                                } catch (Throwable t) {
-                                    log("setMeasuredDimension (callMethod) failed: " + t);
-                                    try {
-                                        java.lang.reflect.Method m = View.class
-                                                .getDeclaredMethod("setMeasuredDimension",
-                                                        int.class, int.class);
-                                        m.setAccessible(true);
-                                        m.invoke(v, v.getMeasuredWidth(), size);
-                                        log("InputView: stretch (reflection) OK");
-                                    } catch (Throwable t2) {
-                                        log("setMeasuredDimension (reflection) failed: " + t2);
-                                    }
-                                }
-                            }
                         }
                     }
             );
 
-            log("hooked InputView.onMeasure (stretch to spec)");
+            log("hooked InputView.onMeasure (диагностика)");
         } catch (Throwable t) {
             log("failed to hook InputView.onMeasure: " + t);
         }
 
         // ============================================================
-        // InputView.onLayout — диагностика
+        // InputView.onLayout — ДИАГНОСТИКА
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -543,9 +540,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             View v = (View) param.thisObject;
                             if (!(v instanceof ViewGroup)) return;
                             ViewGroup vg = (ViewGroup) v;
-                            log("InputView.onLayout: h=" + v.getHeight()
+
+                            int containerH = v.getHeight();
+                            log("InputView.onLayout: h=" + containerH
                                     + ", padB=" + v.getPaddingBottom()
                                     + ", children=" + vg.getChildCount());
+
                             for (int i = 0; i < vg.getChildCount(); i++) {
                                 View child = vg.getChildAt(i);
                                 log("  child[" + i + "] "
@@ -557,6 +557,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         }
                     }
             );
+
+            log("hooked InputView.onLayout (диагностика)");
         } catch (Throwable t) {
             log("failed to hook InputView.onLayout: " + t);
         }
