@@ -21,11 +21,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Убирает пустой нижний отступ у Gboard на Pixel.
  *
  * Диагностика показала:
- *   InputView.onMeasure: mh=2205 (вся высота окна IME)
- *   LinearLayout внутри: mh=541 (клавиатура)
+ *   InputView.onMeasure: mh=2205, padT=-309, padB=0
+ *   child[0] FrameLayout mh=541, grav=80 (BOTTOM)
  *
- * Клавиатура прижата к ВЕРХУ InputView → под ней пустая зона 1664px.
- * Решение: после onLayout принудительно layout'им детей к низу InputView.
+ * Отрицательный padT=-309 — трюк Gboard для компенсации nav bar.
+ * Зануляем padT и padB у InputView — тогда FrameLayout прижмётся
+ * к низу InputView (2205) без зазора.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -217,48 +218,50 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 Drawable.class
         );
 
-        // ============ setPadding ============
+        // ============================================================
+        // ЕДИНЫЙ ХУК: setPadding / setPaddingRelative для InputView
+        // Зануляем И top, И bottom (top был -309!)
+        // ============================================================
+        XC_MethodHook inputViewPaddingHook = new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) {
+                View v = (View) param.thisObject;
+                if (!TARGET_VIEW_CLASS.equals(v.getClass().getName())) return;
+
+                int left = (int) param.args[0];
+                int top = (int) param.args[1];
+                int right = (int) param.args[2];
+                int bottom = (int) param.args[3];
+
+                boolean changed = false;
+                if (top != 0) {
+                    log("InputView padding: zeroing top, was=" + top);
+                    param.args[1] = 0;
+                    changed = true;
+                }
+                if (bottom != 0) {
+                    log("InputView padding: zeroing bottom, was=" + bottom);
+                    param.args[3] = 0;
+                    changed = true;
+                }
+                if (changed) {
+                    log("InputView padding: left=" + left + ", right=" + right);
+                }
+            }
+        };
+
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setPadding",
                 int.class, int.class, int.class, int.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        View v = (View) param.thisObject;
-                        if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
-                            int bottom = (int) param.args[3];
-                            if (bottom > 0) {
-                                log("zeroing InputView bottom padding, was=" + bottom);
-                                param.args[3] = 0;
-                            }
-                        }
-                        if (isNavBarFrame(v)) {
-                            int bottom = (int) param.args[3];
-                            if (bottom > 0) {
-                                param.args[3] = 0;
-                            }
-                        }
-                    }
-                }
+                inputViewPaddingHook
         );
 
         XposedHelpers.findAndHookMethod(
                 View.class,
                 "setPaddingRelative",
                 int.class, int.class, int.class, int.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        View v = (View) param.thisObject;
-                        if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
-                            int bottom = (int) param.args[3];
-                            if (bottom > 0) {
-                                param.args[3] = 0;
-                            }
-                        }
-                    }
-                }
+                inputViewPaddingHook
         );
 
         // ============ NavigationBarFrame ============
@@ -442,7 +445,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         );
 
         // ============================================================
-        // InputView.onMeasure — ДИАГНОСТИКА (без схлопывания)
+        // InputView.onMeasure — СТРАХОВКА
+        // Если setPadding обошли (через internal setPaddingRaw / XML),
+        // зануляем padT и padB тут.
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -454,14 +459,28 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     int.class, int.class,
                     new XC_MethodHook() {
                         @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            int top = v.getPaddingTop();
+                            int bottom = v.getPaddingBottom();
+                            if (top != 0 || bottom != 0) {
+                                log("InputView.onMeasure pre: padT=" + top
+                                        + ", padB=" + bottom + " → zeroing");
+                                v.setPadding(v.getPaddingLeft(), 0,
+                                             v.getPaddingRight(), 0);
+                            }
+                        }
+
+                        @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             View v = (View) param.thisObject;
                             if (!(v instanceof ViewGroup)) return;
                             ViewGroup vg = (ViewGroup) v;
 
                             log("InputView.onMeasure: mh=" + v.getMeasuredHeight()
+                                    + ", padT=" + v.getPaddingTop()
                                     + ", padB=" + v.getPaddingBottom()
-                                    + ", padT=" + v.getPaddingTop());
+                                    + ", children=" + vg.getChildCount());
 
                             for (int i = 0; i < vg.getChildCount(); i++) {
                                 View child = vg.getChildAt(i);
@@ -477,21 +496,19 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 log("  child[" + i + "] "
                                         + child.getClass().getSimpleName()
                                         + " mh=" + child.getMeasuredHeight()
-                                        + " padB=" + child.getPaddingBottom()
-                                        + " grav=" + grav
-                                        + " id=" + safeResName(child));
+                                        + " grav=" + grav);
                             }
                         }
                     }
             );
 
-            log("hooked InputView.onMeasure (диагностика)");
+            log("hooked InputView.onMeasure (zero padT+padB)");
         } catch (Throwable t) {
             log("failed to hook InputView.onMeasure: " + t);
         }
 
         // ============================================================
-        // InputView.onLayout — прижимаем детей к НИЗУ
+        // InputView.onLayout — прижимаем ребёнка к низу
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -510,6 +527,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 ViewGroup vg = (ViewGroup) v;
 
                                 int containerH = v.getHeight();
+                                if (containerH <= 0) return;
+
                                 log("InputView.onLayout: containerH=" + containerH
                                         + ", children=" + vg.getChildCount());
 
@@ -539,6 +558,34 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             log("hooked InputView.onLayout (push to bottom)");
         } catch (Throwable t) {
             log("failed to hook InputView.onLayout: " + t);
+        }
+
+        // ============================================================
+        // План Б: onComputeInsets — если окно IME резервирует высоту
+        // ============================================================
+        try {
+            XposedHelpers.findAndHookMethod(
+                    InputMethodService.class,
+                    "onComputeInsets",
+                    "android.inputmethodservice.InputMethodService$Insets",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            Object insets = param.getResult();
+                            if (insets == null) return;
+                            try {
+                                XposedHelpers.setIntField(insets, "contentTopInsets", 0);
+                                XposedHelpers.setIntField(insets, "visibleTopInsets", 0);
+                                log("onComputeInsets: zeroed contentTopInsets + visibleTopInsets");
+                            } catch (Throwable t) {
+                                log("onComputeInsets patch failed: " + t);
+                            }
+                        }
+                    }
+            );
+            log("hooked onComputeInsets");
+        } catch (Throwable t) {
+            log("failed to hook onComputeInsets: " + t);
         }
 
         // ============ Отладка ============
