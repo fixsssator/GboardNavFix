@@ -21,14 +21,6 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
  * Убирает пустой нижний отступ у Gboard на Pixel.
- *
- * Диагностика:
- *   InputView.onMeasure: mh=2205, spec mode=AT_MOST, size=2205, padT=0, padB=0
- *   child[0] FrameLayout mh=541, grav=80 (BOTTOM)
- *   child top=1664, bottom=2205
- *
- * InputView заполнен полностью, клавиатура прижата к низу. Значит 99px —
- * это НЕ внутри InputView, а часть окна IME. Смотрим LayoutParams окна.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -216,6 +208,32 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             log("hooked setInputView (window LP dump)");
         } catch (Throwable t) {
             log("failed to hook setInputView: " + t);
+        }
+
+        // ============ Window.setAttributes — дамп + зануление y ============
+        try {
+            XposedHelpers.findAndHookMethod(
+                    Window.class,
+                    "setAttributes",
+                    WindowManager.LayoutParams.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            WindowManager.LayoutParams lp =
+                                    (WindowManager.LayoutParams) param.args[0];
+                            if (lp == null) return;
+                            log("Window.setAttributes: h=" + lp.height
+                                    + ", w=" + lp.width
+                                    + ", x=" + lp.x
+                                    + ", y=" + lp.y
+                                    + ", gravity=" + lp.gravity
+                                    + ", flags=0x" + Integer.toHexString(lp.flags));
+                        }
+                    }
+            );
+            log("hooked Window.setAttributes");
+        } catch (Throwable t) {
+            log("failed to hook Window.setAttributes: " + t);
         }
 
         // ============ Иконка языка ============
@@ -470,7 +488,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         );
 
         // ============================================================
-        // InputView.onMeasure — ДИАГНОСТИКА (без схлопывания)
+        // InputView.onMeasure — диагностика
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -524,7 +542,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         // ============================================================
-        // InputView.onLayout — ДИАГНОСТИКА
+        // InputView.onLayout — диагностика
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
