@@ -99,6 +99,15 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         return v != null && NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
     }
 
+    // Безопасный вызов protected View.setMeasuredDimension через Xposed
+    private static void callSetMeasuredDimension(View v, int w, int h) {
+        try {
+            XposedHelpers.callMethod(v, "setMeasuredDimension", w, h);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": setMeasuredDimension failed: " + t);
+        }
+    }
+
     private void forceZeroNavBarFrame(View v) {
         if (v == null) return;
         try {
@@ -415,7 +424,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                         + " → stretch to " + newH);
                             }
 
-                            v.setMeasuredDimension(v.getMeasuredWidth(), newH);
+                            callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
                         }
                     });
 
