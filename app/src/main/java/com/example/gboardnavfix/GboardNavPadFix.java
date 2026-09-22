@@ -5,9 +5,6 @@ import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.ViewParent;
-import android.view.Window;
-import android.view.WindowManager;
 import android.widget.ImageView;
 
 import java.util.Arrays;
@@ -21,21 +18,26 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Gboard Nav Pad Fix
- * Убирает пустую полосу ~99px под клавиатурой на Pixel (gesture nav)
+ * Gboard Nav Pad Fix — чистовик.
  *
- * Главное исправление: onComputeInsets принудительно возвращает 0
- * для contentTopInsets и visibleTopInsets — система перестаёт
- * резервировать место под клавиатуру, и полоса исчезает.
+ * Убирает пустую полосу под клавиатурой Gboard на Pixel (gesture nav).
+ *
+ * Рабочее решение: InputView растягивается на STRETCH_PX (высота nav bar),
+ * Gboard пересчитывает layout и прижимает клавиатуру к низу.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final String TAG = "GboardNavFix";
     private static final String GBOARD_PKG = "com.google.android.inputmethod.latin";
+
     private static final String TARGET_VIEW_CLASS =
             "com.google.android.libraries.inputmethod.inputview.InputView";
+
     private static final String NAV_BAR_FRAME_CLASS =
             "android.inputmethodservice.navigationbar.NavigationBarFrame";
+
+    // На сколько пикселей растягиваем InputView. Подобрано под Pixel.
+    private static final int STRETCH_PX = 99;
 
     private static final String[] TARGET_DIMEN_NAMES = {
             "navigation_bar_height",
@@ -54,10 +56,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final String LANGUAGE_KEY_ID = "key_pos_switch_to_next_language";
 
-    // === Настройки ===
     private static final boolean SPOOF_VERSION_TO_DISABLE_EXPERIMENT = true;
     private static final boolean ADD_CUSTOM_GLOBE_BUTTON = false;
-    private static final boolean APPLY_HIDE_NAVBAR_PROP = true;
+    private static final boolean DEBUG_DUMP = false;
 
     private static final String[] PHENOTYPE_CACHE_PATHS = {
             "files/phenotype",
@@ -98,93 +99,30 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         return v != null && NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
     }
 
-    private void applyHideNavBarProp() {
-        if (!APPLY_HIDE_NAVBAR_PROP) return;
+    // Безопасный вызов protected View.setMeasuredDimension через Xposed
+    private static void callSetMeasuredDimension(View v, int w, int h) {
         try {
-            Class<?> sp = Class.forName("android.os.SystemProperties");
-            XposedHelpers.callStaticMethod(sp, "set", "ro.com.google.ime.kb_pad_port_b", "1.0");
-            XposedHelpers.callStaticMethod(sp, "set", "ro.com.google.ime.kb_pad_land_b", "1.0");
-            log("HideNavBar-like: set ro.com.google.ime.kb_pad_port_b = 1.0");
+            XposedHelpers.callMethod(v, "setMeasuredDimension", w, h);
         } catch (Throwable t) {
-            log("failed to set kb_pad prop: " + t);
+            XposedBridge.log(TAG + ": setMeasuredDimension failed: " + t);
         }
     }
 
     private void forceZeroNavBarFrame(View v) {
         if (v == null) return;
         try {
-            ViewParent parent = v.getParent();
-            if (parent instanceof ViewGroup) {
-                ((ViewGroup) parent).removeView(v);
-                log("NavigationBarFrame REMOVED from parent");
-            }
-
             v.setVisibility(View.GONE);
             v.setMinimumHeight(0);
-
             ViewGroup.LayoutParams lp = v.getLayoutParams();
             if (lp != null) {
                 lp.height = 0;
-                try {
-                    v.setLayoutParams(lp);
-                } catch (Throwable ignored) {}
+                try { v.setLayoutParams(lp); } catch (Throwable ignored) {}
             }
-
             v.setClickable(false);
             v.setFocusable(false);
             v.setEnabled(false);
-
-            v.post(() -> {
-                try {
-                    ViewParent p2 = v.getParent();
-                    if (p2 instanceof ViewGroup) {
-                        ((ViewGroup) p2).removeView(v);
-                    }
-                    v.setVisibility(View.GONE);
-                    v.setMinimumHeight(0);
-                } catch (Throwable ignored) {}
-            });
-            v.postDelayed(() -> forceZeroNavBarFrame(v), 40);
-            v.postDelayed(() -> forceZeroNavBarFrame(v), 150);
-            v.postDelayed(() -> forceZeroNavBarFrame(v), 400);
         } catch (Throwable t) {
             log("forceZeroNavBarFrame failed: " + t);
-        }
-    }
-
-    private void forceImeWindowNoLimits(Window window) {
-        if (window == null) return;
-        try {
-            WindowManager.LayoutParams lp = window.getAttributes();
-            if (lp == null) return;
-
-            log("IME LP BEFORE force: h=" + lp.height
-                    + ", y=" + lp.y
-                    + ", gravity=" + lp.gravity
-                    + ", flags=0x" + Integer.toHexString(lp.flags));
-
-            lp.flags |= WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
-            lp.flags |= WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
-            lp.flags &= ~WindowManager.LayoutParams.FLAG_LAYOUT_INSET_DECOR;
-
-            lp.y = 0;
-
-            window.setAttributes(lp);
-
-            View decor = window.getDecorView();
-            if (decor != null) {
-                decor.setSystemUiVisibility(
-                        View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                );
-            }
-
-            log("IME LP AFTER  force: h=" + lp.height
-                    + ", y=" + lp.y
-                    + ", flags=0x" + Integer.toHexString(lp.flags));
-        } catch (Throwable t) {
-            log("forceImeWindowNoLimits failed: " + t);
         }
     }
 
@@ -200,7 +138,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
         wipePhenotypeCache();
         installCrashGuard();
-        applyHideNavBarProp();
 
         // ============ Спуфинг версии/подписи ============
         if (SPOOF_VERSION_TO_DISABLE_EXPERIMENT) {
@@ -212,7 +149,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         if (!GBOARD_PKG.equals(pkg)) return;
                         Object info = param.getResult();
                         if (info == null) return;
-
                         XposedHelpers.setIntField(info, "versionCode", 999999);
                         try {
                             XposedHelpers.setLongField(info, "versionCodeMajor", 0L);
@@ -238,14 +174,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {}
         }
 
-        // ============ InputMethodService.onCreate ============
+        // ============ InputMethodService ============
         try {
             XposedHelpers.findAndHookMethod(InputMethodService.class, "onCreate",
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             sImeService = (InputMethodService) param.thisObject;
-                            applyHideNavBarProp();
                         }
                     });
         } catch (Throwable t) {
@@ -272,112 +207,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 }
                             }
                         }
-
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            InputMethodService svc = (InputMethodService) param.thisObject;
-                            try {
-                                Window window = svc.getWindow().getWindow();
-                                forceImeWindowNoLimits(window);
-
-                                if (window != null) {
-                                    View decor = window.getDecorView();
-                                    if (decor != null) {
-                                        try {
-                                            Object controller = XposedHelpers.callMethod(
-                                                    decor, "getWindowInsetsController");
-                                            if (controller != null) {
-                                                Class<?> typeClass = Class.forName(
-                                                        "android.view.WindowInsets$Type");
-                                                int captionBar = XposedHelpers.getStaticIntField(
-                                                        typeClass, "captionBar");
-                                                XposedHelpers.callMethod(controller, "hide", captionBar);
-                                                log("requested hide captionBar");
-                                            }
-                                        } catch (Throwable t) {
-                                            log("hide captionBar failed: " + t);
-                                        }
-                                    }
-                                }
-                            } catch (Throwable t) {
-                                log("setInputView after failed: " + t);
-                            }
-                        }
                     });
-            log("hooked setInputView");
         } catch (Throwable t) {
             log("failed to hook setInputView: " + t);
-        }
-
-        // ============ Window.setAttributes ============
-        try {
-            XposedHelpers.findAndHookMethod(Window.class, "setAttributes",
-                    WindowManager.LayoutParams.class, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            WindowManager.LayoutParams lp =
-                                    (WindowManager.LayoutParams) param.args[0];
-                            if (lp == null) return;
-
-                            if (lp.type == WindowManager.LayoutParams.TYPE_INPUT_METHOD) {
-                                log("IME setAttributes BEFORE: h=" + lp.height
-                                        + ", y=" + lp.y
-                                        + ", gravity=" + lp.gravity
-                                        + ", flags=0x" + Integer.toHexString(lp.flags));
-
-                                lp.flags |= WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
-                                lp.flags |= WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
-                                lp.flags &= ~WindowManager.LayoutParams.FLAG_LAYOUT_INSET_DECOR;
-                                lp.y = 0;
-
-                                log("IME setAttributes AFTER : h=" + lp.height
-                                        + ", y=" + lp.y
-                                        + ", flags=0x" + Integer.toHexString(lp.flags));
-                            }
-                        }
-                    });
-            log("hooked Window.setAttributes");
-        } catch (Throwable t) {
-            log("failed to hook Window.setAttributes: " + t);
-        }
-
-        // ============================================================
-        // ГЛАВНЫЙ ХУК: onComputeInsets — зануляем insets
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(InputMethodService.class, "onComputeInsets",
-                    InputMethodService.Insets.class, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            InputMethodService.Insets insets =
-                                    (InputMethodService.Insets) param.args[0];
-                            if (insets == null) return;
-                            log("onComputeInsets BEFORE: contentTop=" + insets.contentTopInsets
-                                    + ", visibleTop=" + insets.visibleTopInsets
-                                    + ", touchable=" + insets.touchableInsets);
-                            insets.contentTopInsets = 0;
-                            insets.visibleTopInsets = 0;
-                        }
-
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            InputMethodService.Insets insets =
-                                    (InputMethodService.Insets) param.args[0];
-                            if (insets == null) return;
-
-                            int oldContent = insets.contentTopInsets;
-                            int oldVisible = insets.visibleTopInsets;
-
-                            insets.contentTopInsets = 0;
-                            insets.visibleTopInsets = 0;
-
-                            log("onComputeInsets FORCED: content " + oldContent
-                                    + " → 0, visible " + oldVisible + " → 0");
-                        }
-                    });
-            log("hooked onComputeInsets (force zero)");
-        } catch (Throwable t) {
-            log("failed to hook onComputeInsets: " + t);
         }
 
         // ============ Иконка языка ============
@@ -411,14 +243,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         View v = (View) param.thisObject;
                         if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
                             int bottom = (int) param.args[3];
-                            int top = (int) param.args[1];
                             if (bottom > 0) {
                                 log("zeroing InputView bottom padding, was=" + bottom);
                                 param.args[3] = 0;
-                            }
-                            if (top < 0) {
-                                log("zeroing InputView negative top padding, was=" + top);
-                                param.args[1] = 0;
                             }
                         }
                         if (isNavBarFrame(v) && (int) param.args[3] > 0) {
@@ -432,9 +259,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
-                        if (TARGET_VIEW_CLASS.equals(v.getClass().getName())) {
-                            if ((int) param.args[3] > 0) param.args[3] = 0;
-                            if ((int) param.args[1] < 0) param.args[1] = 0;
+                        if (TARGET_VIEW_CLASS.equals(v.getClass().getName())
+                                && (int) param.args[3] > 0) {
+                            param.args[3] = 0;
                         }
                     }
                 });
@@ -445,7 +272,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (isNavBarFrame((View) param.thisObject) && (int) param.args[0] > 0) {
-                            log("zeroing NavBarFrame minHeight was=" + param.args[0]);
                             param.args[0] = 0;
                         }
                     }
@@ -457,23 +283,11 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         if (isNavBarFrame(v)) {
-                            ViewGroup.LayoutParams lp = (ViewGroup.LayoutParams) param.args[0];
+                            ViewGroup.LayoutParams lp =
+                                    (ViewGroup.LayoutParams) param.args[0];
                             if (lp != null && lp.height > 0) {
-                                log("zeroing NavBarFrame height was=" + lp.height);
                                 lp.height = 0;
                             }
-                        }
-                    }
-                });
-
-        XposedHelpers.findAndHookMethod(View.class, "setVisibility", int.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        if (isNavBarFrame((View) param.thisObject)
-                                && (int) param.args[0] != View.GONE) {
-                            log("forcing NavBarFrame to GONE");
-                            param.args[0] = View.GONE;
                         }
                     }
                 });
@@ -490,16 +304,16 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 });
 
         // ============ Resources dimen ============
-        XposedHelpers.findAndHookMethod(Resources.class, "getDimensionPixelSize", int.class,
-                new XC_MethodHook() {
+        XposedHelpers.findAndHookMethod(Resources.class, "getDimensionPixelSize",
+                int.class, new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         maybeZeroOut(param);
                     }
                 });
 
-        XposedHelpers.findAndHookMethod(Resources.class, "getDimension", int.class,
-                new XC_MethodHook() {
+        XposedHelpers.findAndHookMethod(Resources.class, "getDimension",
+                int.class, new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         int resId = (int) param.args[0];
@@ -510,7 +324,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 });
 
-        // ============ Скрытие кнопок ============
+        // ============ Hide nav bar buttons ============
         XposedHelpers.findAndHookMethod(View.class, "setVisibility", int.class,
                 new XC_MethodHook() {
                     @Override
@@ -518,7 +332,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
                         if (isAlwaysHidden(v, idName)) {
-                            if ((int) param.args[0] != View.GONE) param.args[0] = View.GONE;
+                            if ((int) param.args[0] != View.GONE) {
+                                param.args[0] = View.GONE;
+                            }
                         } else if (LANGUAGE_KEY_ID.equals(idName)
                                 && isLanguageCd(v.getContentDescription())
                                 && (int) param.args[0] != View.GONE) {
@@ -533,9 +349,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     protected void beforeHookedMethod(MethodHookParam param) {
                         View v = (View) param.thisObject;
                         String idName = safeResName(v);
-                        if (isAlwaysHidden(v, idName)
-                                || (LANGUAGE_KEY_ID.equals(idName)
-                                && isLanguageCd(v.getContentDescription()))) {
+                        if (isAlwaysHidden(v, idName)) {
+                            param.setResult(false);
+                        } else if (LANGUAGE_KEY_ID.equals(idName)
+                                && isLanguageCd(v.getContentDescription())) {
                             param.setResult(false);
                         }
                     }
@@ -552,6 +369,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 });
 
+        // ============ key_pos_switch_to_next_language ============
         XposedHelpers.findAndHookMethod(View.class, "setContentDescription",
                 CharSequence.class, new XC_MethodHook() {
                     @Override
@@ -565,17 +383,20 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 v.setClickable(false);
                                 v.setFocusable(false);
                             } else if (isLanguageCd(cd)) {
-                                log("real language key visible (spoof active): cd=\"" + cd + "\"");
+                                log("real language key visible: cd=\"" + cd + "\"");
                             } else if (ADD_CUSTOM_GLOBE_BUTTON) {
-                                // repurposeAsLanguageKey(v, cd);
+                                repurposeAsLanguageKey(v, cd);
                             }
                         }
                     }
                 });
 
-        // ============ Диагностика InputView ============
+        // ============================================================
+        // ГЛАВНЫЙ РАБОЧИЙ ХУК: растягиваем InputView на STRETCH_PX
+        // ============================================================
         try {
-            Class<?> inputViewClass = Class.forName(TARGET_VIEW_CLASS, false, lpparam.classLoader);
+            Class<?> inputViewClass = Class.forName(
+                    TARGET_VIEW_CLASS, false, lpparam.classLoader);
 
             XposedHelpers.findAndHookMethod(inputViewClass, "onMeasure",
                     int.class, int.class, new XC_MethodHook() {
@@ -583,43 +404,73 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         protected void afterHookedMethod(MethodHookParam param) {
                             View v = (View) param.thisObject;
                             if (!(v instanceof ViewGroup)) return;
-                            ViewGroup vg = (ViewGroup) v;
-                            log("InputView.onMeasure: mh=" + v.getMeasuredHeight()
-                                    + ", padT=" + v.getPaddingTop()
-                                    + ", padB=" + v.getPaddingBottom()
-                                    + ", children=" + vg.getChildCount());
-                            for (int i = 0; i < Math.min(vg.getChildCount(), 2); i++) {
-                                View child = vg.getChildAt(i);
-                                log("  child[" + i + "] " + child.getClass().getSimpleName()
-                                        + " mh=" + child.getMeasuredHeight());
+
+                            int hSpec = (int) param.args[1];
+                            int size = View.MeasureSpec.getSize(hSpec);
+                            int mh = v.getMeasuredHeight();
+                            int newH = mh + STRETCH_PX;
+
+                            if (size > 0 && newH > size) {
+                                newH = size;
                             }
+
+                            if (DEBUG_DUMP) {
+                                ViewGroup vg = (ViewGroup) v;
+                                log("InputView.onMeasure: mh=" + mh
+                                        + ", size=" + size
+                                        + ", padT=" + v.getPaddingTop()
+                                        + ", padB=" + v.getPaddingBottom()
+                                        + ", children=" + vg.getChildCount()
+                                        + " → stretch to " + newH);
+                            }
+
+                            callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
                         }
                     });
 
-            XposedHelpers.findAndHookMethod(inputViewClass, "onLayout",
-                    boolean.class, int.class, int.class, int.class, int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            View v = (View) param.thisObject;
-                            if (!(v instanceof ViewGroup)) return;
-                            ViewGroup vg = (ViewGroup) v;
-                            log("InputView.onLayout: h=" + v.getHeight()
-                                    + ", padB=" + v.getPaddingBottom());
-                            for (int i = 0; i < Math.min(vg.getChildCount(), 2); i++) {
-                                View child = vg.getChildAt(i);
-                                log("  child[" + i + "] top=" + child.getTop()
-                                        + " h=" + child.getHeight());
-                            }
-                        }
-                    });
-            log("hooked InputView measure/layout");
+            log("hooked InputView.onMeasure (stretch " + STRETCH_PX + "px)");
         } catch (Throwable t) {
-            log("failed to hook InputView: " + t);
+            log("failed to hook InputView.onMeasure: " + t);
+        }
+
+        // ============================================================
+        // InputView.onLayout — только диагностика при DEBUG_DUMP
+        // ============================================================
+        if (DEBUG_DUMP) {
+            try {
+                Class<?> inputViewClass = Class.forName(
+                        TARGET_VIEW_CLASS, false, lpparam.classLoader);
+
+                XposedHelpers.findAndHookMethod(inputViewClass, "onLayout",
+                        boolean.class, int.class, int.class, int.class, int.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                View v = (View) param.thisObject;
+                                if (!(v instanceof ViewGroup)) return;
+                                ViewGroup vg = (ViewGroup) v;
+                                log("InputView.onLayout: h=" + v.getHeight()
+                                        + ", padB=" + v.getPaddingBottom()
+                                        + ", children=" + vg.getChildCount());
+                                for (int i = 0; i < vg.getChildCount(); i++) {
+                                    View child = vg.getChildAt(i);
+                                    log("  child[" + i + "] "
+                                            + child.getClass().getSimpleName()
+                                            + " top=" + child.getTop()
+                                            + " bottom=" + child.getBottom()
+                                            + " h=" + child.getHeight());
+                                }
+                            }
+                        });
+
+                log("hooked InputView.onLayout (диагностика)");
+            } catch (Throwable t) {
+                log("failed to hook InputView.onLayout: " + t);
+            }
         }
     }
 
-    // ===================== Phenotype / Crash / Signature =====================
+    // ===================== Phenotype cache =====================
 
     private void wipePhenotypeCache() {
         String base = "/data/data/" + GBOARD_PKG + "/";
@@ -646,17 +497,23 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         return f.delete();
     }
 
+    // ===================== Crash guard =====================
+
     private void installCrashGuard() {
         try {
             final Thread.UncaughtExceptionHandler original =
                     Thread.getDefaultUncaughtExceptionHandler();
-            Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
-                if (isSelfInflictedSignatureCrash(e)) {
-                    log("suppressed signature crash: " + e);
-                    return;
+            Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+                @Override
+                public void uncaughtException(Thread t, Throwable e) {
+                    if (isSelfInflictedSignatureCrash(e)) {
+                        log("suppressed self-inflicted signature-check crash on thread "
+                                + t.getName() + ": " + e);
+                        return;
+                    }
+                    if (original != null) original.uncaughtException(t, e);
+                    else System.exit(1);
                 }
-                if (original != null) original.uncaughtException(t, e);
-                else System.exit(1);
             });
             log("installed crash guard");
         } catch (Throwable t) {
@@ -679,6 +536,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         return false;
     }
 
+    // ===================== Signature spoofing =====================
+
     private void spoofSignatureFields(Object packageInfo) {
         try {
             android.content.pm.Signature dummy = new android.content.pm.Signature(
@@ -699,7 +558,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     }
 
     private void patchSignaturesRecursively(Object obj,
-                                            android.content.pm.Signature dummy, int depth) {
+                                             android.content.pm.Signature dummy,
+                                             int depth) {
         if (obj == null || depth < 0) return;
         Class<?> cls = obj.getClass();
         while (cls != null && cls != Object.class) {
@@ -724,6 +584,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
     }
 
+    // ===================== Helpers =====================
+
     private String safeResName(View v) {
         try {
             int id = v.getId();
@@ -732,6 +594,62 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         } catch (Exception e) {
             return "?";
         }
+    }
+
+    private void repurposeAsLanguageKey(View v, CharSequence originalCd) {
+        try {
+            if (REPURPOSED_TAG.equals(v.getTag())) return;
+            if (sLanguageIconDrawable == null) return;
+            boolean iconSet = false;
+            if (v instanceof ImageView) {
+                try {
+                    Drawable fresh = sLanguageIconDrawable.getConstantState() != null
+                            ? sLanguageIconDrawable.getConstantState().newDrawable().mutate()
+                            : sLanguageIconDrawable;
+                    ((ImageView) v).setImageDrawable(fresh);
+                    iconSet = true;
+                } catch (Throwable t) {
+                    log("repurpose: setImageDrawable failed: " + t);
+                }
+            } else {
+                iconSet = trySetDrawableField(v);
+            }
+            v.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    InputMethodService svc = sImeService;
+                    if (svc != null) {
+                        try { svc.switchToNextInputMethod(false); }
+                        catch (Throwable t) { log("switchToNextInputMethod failed: " + t); }
+                    }
+                }
+            });
+            v.setTag(REPURPOSED_TAG);
+            log("repurposed emoji-slot key as language switch, iconSet=" + iconSet);
+        } catch (Throwable t) {
+            log("repurposeAsLanguageKey failed: " + t);
+        }
+    }
+
+    private boolean trySetDrawableField(View v) {
+        Class<?> cls = v.getClass();
+        while (cls != null && cls != Object.class) {
+            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                if (Drawable.class.isAssignableFrom(f.getType())) {
+                    try {
+                        f.setAccessible(true);
+                        Drawable fresh = sLanguageIconDrawable.getConstantState() != null
+                                ? sLanguageIconDrawable.getConstantState().newDrawable().mutate()
+                                : sLanguageIconDrawable;
+                        f.set(v, fresh);
+                        v.invalidate();
+                        return true;
+                    } catch (Throwable ignored) {}
+                }
+            }
+            cls = cls.getSuperclass();
+        }
+        return false;
     }
 
     private void maybeZeroOut(XC_MethodHook.MethodHookParam param) {
