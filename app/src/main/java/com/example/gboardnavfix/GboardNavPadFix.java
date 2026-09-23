@@ -24,6 +24,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  * Рабочее решение: InputView растягивается на STRETCH_PX (высота nav bar),
  * Gboard пересчитывает layout и прижимает клавиатуру к низу.
+ *
+ * Пост-фикс через v.post() лечит "проскок" полосы при первом запуске
+ * после переустановки.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -393,6 +396,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
         // ============================================================
         // ГЛАВНЫЙ РАБОЧИЙ ХУК: растягиваем InputView на STRETCH_PX
+        // + пост-фикс через v.post()
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -408,27 +412,40 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             int hSpec = (int) param.args[1];
                             int size = View.MeasureSpec.getSize(hSpec);
                             int mh = v.getMeasuredHeight();
-                            int newH = mh + STRETCH_PX;
 
-                            if (size > 0 && newH > size) {
-                                newH = size;
-                            }
+                            // Игнорируем холостые вызовы, когда Gboard ещё не измерил
+                            if (mh <= 0) return;
+
+                            int newH = mh + STRETCH_PX;
+                            if (size > 0 && newH > size) newH = size;
 
                             if (DEBUG_DUMP) {
-                                ViewGroup vg = (ViewGroup) v;
                                 log("InputView.onMeasure: mh=" + mh
                                         + ", size=" + size
                                         + ", padT=" + v.getPaddingTop()
                                         + ", padB=" + v.getPaddingBottom()
-                                        + ", children=" + vg.getChildCount()
                                         + " → stretch to " + newH);
                             }
 
                             callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
+
+                            // Пост-фикс: через кадр принудительно перекладываем InputView
+                            v.post(() -> {
+                                try {
+                                    if (v.getHeight() != newH) {
+                                        log("post-fix: height " + v.getHeight()
+                                                + " → " + newH);
+                                        v.layout(v.getLeft(), v.getTop(),
+                                                 v.getRight(), v.getTop() + newH);
+                                    }
+                                } catch (Throwable t) {
+                                    log("post-fix failed: " + t);
+                                }
+                            });
                         }
                     });
 
-            log("hooked InputView.onMeasure (stretch " + STRETCH_PX + "px)");
+            log("hooked InputView.onMeasure (stretch " + STRETCH_PX + "px + post-fix)");
         } catch (Throwable t) {
             log("failed to hook InputView.onMeasure: " + t);
         }
