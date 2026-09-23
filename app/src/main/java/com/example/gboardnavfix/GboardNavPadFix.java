@@ -25,8 +25,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Рабочее решение: InputView растягивается на STRETCH_PX (высота nav bar),
  * Gboard пересчитывает layout и прижимает клавиатуру к низу.
  *
- * Пост-фикс через v.post() лечит "проскок" полосы при первом запуске
- * после переустановки.
+ * Пост-фикс через v.post() лечит "проскок" полосы при первом запуске.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -102,7 +101,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         return v != null && NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
     }
 
-    // Безопасный вызов protected View.setMeasuredDimension через Xposed
     private static void callSetMeasuredDimension(View v, int w, int h) {
         try {
             XposedHelpers.callMethod(v, "setMeasuredDimension", w, h);
@@ -395,8 +393,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 });
 
         // ============================================================
-        // ГЛАВНЫЙ РАБОЧИЙ ХУК: растягиваем InputView на STRETCH_PX
-        // + пост-фикс через v.post()
+        // ГЛАВНЫЙ РАБОЧИЙ ХУК: растягиваем InputView + пост-фикс
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -413,11 +410,16 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             int size = View.MeasureSpec.getSize(hSpec);
                             int mh = v.getMeasuredHeight();
 
-                            // Игнорируем холостые вызовы, когда Gboard ещё не измерил
+                            // Игнорируем холостые вызовы
                             if (mh <= 0) return;
 
-                            int newH = mh + STRETCH_PX;
-                            if (size > 0 && newH > size) newH = size;
+                            // final — чтобы лямбда ниже могла его захватить
+                            final int newH;
+                            if (size > 0 && mh + STRETCH_PX > size) {
+                                newH = size;
+                            } else {
+                                newH = mh + STRETCH_PX;
+                            }
 
                             if (DEBUG_DUMP) {
                                 log("InputView.onMeasure: mh=" + mh
@@ -430,16 +432,19 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
 
                             // Пост-фикс: через кадр принудительно перекладываем InputView
-                            v.post(() -> {
-                                try {
-                                    if (v.getHeight() != newH) {
-                                        log("post-fix: height " + v.getHeight()
-                                                + " → " + newH);
-                                        v.layout(v.getLeft(), v.getTop(),
-                                                 v.getRight(), v.getTop() + newH);
+                            v.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try {
+                                        if (v.getHeight() != newH) {
+                                            log("post-fix: height " + v.getHeight()
+                                                    + " → " + newH);
+                                            v.layout(v.getLeft(), v.getTop(),
+                                                     v.getRight(), v.getTop() + newH);
+                                        }
+                                    } catch (Throwable t) {
+                                        log("post-fix failed: " + t);
                                     }
-                                } catch (Throwable t) {
-                                    log("post-fix failed: " + t);
                                 }
                             });
                         }
