@@ -25,7 +25,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Рабочее решение: InputView растягивается на STRETCH_PX (высота nav bar),
  * Gboard пересчитывает layout и прижимает клавиатуру к низу.
  *
- * Пост-фикс через v.post() лечит "проскок" полосы при первом запуске.
+ * Пост-фиксы через postDelayed + хук на View.layout лечат "проскок" полосы
+ * при пересоздании InputView.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -38,8 +39,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final String NAV_BAR_FRAME_CLASS =
             "android.inputmethodservice.navigationbar.NavigationBarFrame";
 
-    // На сколько пикселей растягиваем InputView. Подобрано под Pixel.
     private static final int STRETCH_PX = 99;
+
+    // Задержки для пост-фиксов
+    private static final int[] POST_DELAYS = {0, 50, 150, 300, 600, 1000};
 
     private static final String[] TARGET_DIMEN_NAMES = {
             "navigation_bar_height",
@@ -60,7 +63,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static final boolean SPOOF_VERSION_TO_DISABLE_EXPERIMENT = true;
     private static final boolean ADD_CUSTOM_GLOBE_BUTTON = false;
-    private static final boolean DEBUG_DUMP = false;
+    private static final boolean DEBUG_DUMP = true;
 
     private static final String[] PHENOTYPE_CACHE_PATHS = {
             "files/phenotype",
@@ -99,6 +102,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isNavBarFrame(View v) {
         return v != null && NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
+    }
+
+    private static boolean isInputView(View v) {
+        return v != null && TARGET_VIEW_CLASS.equals(v.getClass().getName());
     }
 
     private static void callSetMeasuredDimension(View v, int w, int h) {
@@ -393,7 +400,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 });
 
         // ============================================================
-        // ГЛАВНЫЙ РАБОЧИЙ ХУК: растягиваем InputView + пост-фикс
+        // ГЛАВНЫЙ РАБОЧИЙ ХУК: растягиваем InputView + пост-фиксы
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -410,10 +417,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             int size = View.MeasureSpec.getSize(hSpec);
                             int mh = v.getMeasuredHeight();
 
-                            // Игнорируем холостые вызовы
                             if (mh <= 0) return;
 
-                            // final — чтобы лямбда ниже могла его захватить
                             final int newH;
                             if (size > 0 && mh + STRETCH_PX > size) {
                                 newH = size;
@@ -431,32 +436,71 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
                             callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
 
-                            // Пост-фикс: через кадр принудительно перекладываем InputView
-                            v.post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    try {
-                                        if (v.getHeight() != newH) {
-                                            log("post-fix: height " + v.getHeight()
-                                                    + " → " + newH);
-                                            v.layout(v.getLeft(), v.getTop(),
-                                                     v.getRight(), v.getTop() + newH);
+                            // Цепочка пост-фиксов с задержками
+                            for (final int delay : POST_DELAYS) {
+                                v.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try {
+                                            if (v.getHeight() != newH) {
+                                                log("post-fix[" + delay + "]: height "
+                                                        + v.getHeight() + " → " + newH);
+                                                v.layout(v.getLeft(), v.getTop(),
+                                                         v.getRight(),
+                                                         v.getTop() + newH);
+                                            }
+                                        } catch (Throwable t) {
+                                            log("post-fix[" + delay + "] failed: " + t);
                                         }
-                                    } catch (Throwable t) {
-                                        log("post-fix failed: " + t);
                                     }
-                                }
-                            });
+                                }, delay);
+                            }
                         }
                     });
 
-            log("hooked InputView.onMeasure (stretch " + STRETCH_PX + "px + post-fix)");
+            log("hooked InputView.onMeasure (stretch " + STRETCH_PX + "px + post-fixes)");
         } catch (Throwable t) {
             log("failed to hook InputView.onMeasure: " + t);
         }
 
         // ============================================================
-        // InputView.onLayout — только диагностика при DEBUG_DUMP
+        // Хук на View.layout — принудительно растягиваем InputView
+        // при каждой попытке Gboard его переложить
+        // ============================================================
+        try {
+            XposedHelpers.findAndHookMethod(View.class, "layout",
+                    int.class, int.class, int.class, int.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            if (!isInputView(v)) return;
+
+                            int left = (int) param.args[0];
+                            int top = (int) param.args[1];
+                            int right = (int) param.args[2];
+                            int bottom = (int) param.args[3];
+                            int h = bottom - top;
+
+                            // Игнорируем аномальные значения
+                            if (h <= 0 || h > 2600) return;
+
+                            int newBottom = top + h + STRETCH_PX;
+
+                            if (DEBUG_DUMP) {
+                                log("View.layout(InputView): bottom " + bottom
+                                        + " → " + newBottom);
+                            }
+
+                            param.args[3] = newBottom;
+                        }
+                    });
+            log("hooked View.layout (InputView stretch)");
+        } catch (Throwable t) {
+            log("failed to hook View.layout: " + t);
+        }
+
+        // ============================================================
+        // InputView.onLayout — диагностика
         // ============================================================
         if (DEBUG_DUMP) {
             try {
