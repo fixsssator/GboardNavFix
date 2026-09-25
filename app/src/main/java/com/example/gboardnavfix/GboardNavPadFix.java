@@ -5,6 +5,8 @@ import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 
 import java.util.Arrays;
@@ -22,8 +24,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  * Убирает пустую полосу под клавиатурой Gboard на Pixel (gesture nav).
  *
- * Рабочее решение: InputView.onMeasure → setMeasuredDimension(w, mh + 99).
- * View.layout НЕ трогаем, чтобы не было двойного растяжения.
+ * Рабочее решение:
+ *   1. InputView.onMeasure — setMeasuredDimension(w, mh + 99)
+ *   2. FrameLayout (ребёнок InputView).onMeasure — setMeasuredDimension(w, mh + 99)
+ *      чтобы клавиатура занимала всю высоту InputView и нижний ряд не обрезался.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -96,6 +100,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isNavBarFrame(View v) {
         return v != null && NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
+    }
+
+    private static boolean isInputView(View v) {
+        return v != null && TARGET_VIEW_CLASS.equals(v.getClass().getName());
     }
 
     private static void callSetMeasuredDimension(View v, int w, int h) {
@@ -390,7 +398,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 });
 
         // ============================================================
-        // ЕДИНСТВЕННЫЙ рабочий хук: InputView.onMeasure
+        // InputView.onMeasure — растягиваем до mh + STRETCH_PX
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -423,7 +431,42 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         // ============================================================
-        // InputView.onLayout — только диагностика
+        // FrameLayout (ребёнок InputView).onMeasure —
+        // тоже растягиваем, чтобы клавиатура заняла всю высоту InputView
+        // ============================================================
+        try {
+            XposedHelpers.findAndHookMethod(FrameLayout.class, "onMeasure",
+                    int.class, int.class, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+
+                            ViewParent parent = v.getParent();
+                            if (!(parent instanceof View)) return;
+                            View p = (View) parent;
+                            if (!isInputView(p)) return;
+
+                            int mh = v.getMeasuredHeight();
+                            if (mh <= 0) return;
+
+                            int newH = mh + STRETCH_PX;
+
+                            if (DEBUG_DUMP) {
+                                log("FrameLayout(InputView child).onMeasure: mh=" + mh
+                                        + " → stretch to " + newH);
+                            }
+
+                            callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
+                        }
+                    });
+
+            log("hooked FrameLayout.onMeasure (InputView child stretch)");
+        } catch (Throwable t) {
+            log("failed to hook FrameLayout.onMeasure: " + t);
+        }
+
+        // ============================================================
+        // InputView.onLayout — диагностика
         // ============================================================
         if (DEBUG_DUMP) {
             try {
