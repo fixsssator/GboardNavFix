@@ -22,11 +22,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  * Убирает пустую полосу под клавиатурой Gboard на Pixel (gesture nav).
  *
- * Рабочее решение:
- *   1. InputView.onMeasure — setMeasuredDimension(w, mh + 99)
- *   2. View.layout для InputView — при каждом layout bottom += 99
- *
- * Никаких post-fix — они конфликтуют с View.layout.
+ * Рабочее решение: InputView.onMeasure → setMeasuredDimension(w, mh + 99).
+ * View.layout НЕ трогаем, чтобы не было двойного растяжения.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -99,10 +96,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isNavBarFrame(View v) {
         return v != null && NAV_BAR_FRAME_CLASS.equals(v.getClass().getName());
-    }
-
-    private static boolean isInputView(View v) {
-        return v != null && TARGET_VIEW_CLASS.equals(v.getClass().getName());
     }
 
     private static void callSetMeasuredDimension(View v, int w, int h) {
@@ -397,7 +390,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 });
 
         // ============================================================
-        // InputView.onMeasure — растягиваем до mh + STRETCH_PX
+        // ЕДИНСТВЕННЫЙ рабочий хук: InputView.onMeasure
         // ============================================================
         try {
             Class<?> inputViewClass = Class.forName(
@@ -421,7 +414,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             }
 
                             callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
-                            // НЕ добавляем post-fix — View.layout сам растянет
                         }
                     });
 
@@ -431,40 +423,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         // ============================================================
-        // View.layout — принудительно растягиваем InputView
-        // ============================================================
-        try {
-            XposedHelpers.findAndHookMethod(View.class, "layout",
-                    int.class, int.class, int.class, int.class, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            View v = (View) param.thisObject;
-                            if (!isInputView(v)) return;
-
-                            int top = (int) param.args[1];
-                            int bottom = (int) param.args[3];
-                            int h = bottom - top;
-
-                            // Игнорируем аномальные значения
-                            if (h <= 0 || h > 2600) return;
-
-                            int newBottom = top + h + STRETCH_PX;
-
-                            if (DEBUG_DUMP) {
-                                log("View.layout(InputView): bottom " + bottom
-                                        + " → " + newBottom);
-                            }
-
-                            param.args[3] = newBottom;
-                        }
-                    });
-            log("hooked View.layout (InputView stretch)");
-        } catch (Throwable t) {
-            log("failed to hook View.layout: " + t);
-        }
-
-        // ============================================================
-        // InputView.onLayout — диагностика
+        // InputView.onLayout — только диагностика
         // ============================================================
         if (DEBUG_DUMP) {
             try {
