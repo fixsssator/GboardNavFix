@@ -25,9 +25,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Убирает пустую полосу под клавиатурой Gboard на Pixel (gesture nav).
  *
  * Рабочее решение:
- *   1. InputView.onMeasure — setMeasuredDimension(w, mh + 99)
- *   2. FrameLayout (ребёнок InputView).onMeasure — setMeasuredDimension(w, mh + 99)
- *      чтобы клавиатура занимала всю высоту InputView и нижний ряд не обрезался.
+ *   1. InputView.onMeasure → setMeasuredDimension(w, mh + 99)
+ *   2. FrameLayout (ребёнок InputView).onMeasure → setMeasuredDimension(w, mh + 99)
+ *   3. Пост-проверки fix[] догоняют правильную высоту после того,
+ *      как окно IME устаканилось (лечит "проскок" при первом запуске).
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -41,6 +42,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             "android.inputmethodservice.navigationbar.NavigationBarFrame";
 
     private static final int STRETCH_PX = 99;
+    private static final int[] FIX_DELAYS = {0, 100, 300, 700, 1500};
 
     private static final String[] TARGET_DIMEN_NAMES = {
             "navigation_bar_height",
@@ -129,6 +131,29 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             v.setEnabled(false);
         } catch (Throwable t) {
             log("forceZeroNavBarFrame failed: " + t);
+        }
+    }
+
+    // Серия пост-проверок: если высота не совпала с measuredHeight,
+    // принудительно перекладываем View через layout()
+    private void scheduleFixChecks(final View v) {
+        for (final int delay : FIX_DELAYS) {
+            v.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        int actualH = v.getHeight();
+                        int targetH = v.getMeasuredHeight();
+                        if (targetH > 0 && actualH != targetH) {
+                            log("fix[" + delay + "]: " + actualH + " → " + targetH);
+                            v.layout(v.getLeft(), v.getTop(),
+                                     v.getRight(), v.getTop() + targetH);
+                        }
+                    } catch (Throwable t) {
+                        log("fix[" + delay + "] failed: " + t);
+                    }
+                }
+            }, delay);
         }
     }
 
@@ -422,6 +447,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             }
 
                             callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
+                            scheduleFixChecks(v);
                         }
                     });
 
@@ -457,6 +483,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                             }
 
                             callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
+                            scheduleFixChecks(v);
                         }
                     });
 
