@@ -6,6 +6,8 @@ import android.inputmethodservice.InputMethodService;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
+import android.view.Window;
+import android.view.WindowInsets;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 
@@ -27,8 +29,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Рабочее решение:
  *   1. InputView.onMeasure → setMeasuredDimension(w, mh + 99)
  *   2. FrameLayout (ребёнок InputView).onMeasure → setMeasuredDimension(w, mh + 99)
- *   3. Пост-проверки fix[] догоняют правильную высоту после того,
- *      как окно IME устаканилось (лечит "проскок" при первом запуске).
+ *   3. Пост-проверки fix[] догоняют правильную высоту.
+ *   4. ДАМП WindowInsets в setInputView — для диагностики полосы снизу.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -134,8 +136,6 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
     }
 
-    // Серия пост-проверок: если высота не совпала с measuredHeight,
-    // принудительно перекладываем View через layout()
     private void scheduleFixChecks(final View v) {
         for (final int delay : FIX_DELAYS) {
             v.postDelayed(new Runnable() {
@@ -154,6 +154,35 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     }
                 }
             }, delay);
+        }
+    }
+
+    private void dumpWindowInsets(InputMethodService svc) {
+        try {
+            Window window = svc.getWindow().getWindow();
+            if (window == null) {
+                log("Insets: window is null");
+                return;
+            }
+            View decor = window.getDecorView();
+            if (decor == null) {
+                log("Insets: decor is null");
+                return;
+            }
+            WindowInsets insets = decor.getRootWindowInsets();
+            if (insets == null) {
+                log("Insets: rootWindowInsets is null");
+                return;
+            }
+            log("Insets: sysBars=" + insets.getInsets(WindowInsets.Type.systemBars()).bottom
+                    + ", navBars=" + insets.getInsets(WindowInsets.Type.navigationBars()).bottom
+                    + ", captionBar=" + insets.getInsets(WindowInsets.Type.captionBar()).bottom
+                    + ", ime=" + insets.getInsets(WindowInsets.Type.ime()).bottom
+                    + ", statusBars=" + insets.getInsets(WindowInsets.Type.statusBars()).bottom
+                    + ", mandatorySys=" + insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom
+                    + ", tappableElement=" + insets.getInsets(WindowInsets.Type.tappableElement()).bottom);
+        } catch (Throwable t) {
+            log("dumpWindowInsets failed: " + t);
         }
     }
 
@@ -237,6 +266,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                     );
                                 }
                             }
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            InputMethodService svc = (InputMethodService) param.thisObject;
+                            dumpWindowInsets(svc);
                         }
                     });
         } catch (Throwable t) {
@@ -457,8 +492,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         // ============================================================
-        // FrameLayout (ребёнок InputView).onMeasure —
-        // тоже растягиваем, чтобы клавиатура заняла всю высоту InputView
+        // FrameLayout (ребёнок InputView).onMeasure — растягиваем
         // ============================================================
         try {
             XposedHelpers.findAndHookMethod(FrameLayout.class, "onMeasure",
