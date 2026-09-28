@@ -29,8 +29,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Рабочее решение:
  *   1. InputView.onMeasure → setMeasuredDimension(w, mh + 99)
  *   2. FrameLayout (ребёнок InputView).onMeasure → setMeasuredDimension(w, mh + 99)
- *   3. Пост-проверки fix[] догоняют правильную высоту.
- *   4. ДАМП WindowInsets в setInputView — для диагностики полосы снизу.
+ *   3. Скрытие captionBar через WindowInsetsController (Android 13+).
+ *   4. Пост-проверки fix[] догоняют правильную высоту.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -160,29 +160,47 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private void dumpWindowInsets(InputMethodService svc) {
         try {
             Window window = svc.getWindow().getWindow();
-            if (window == null) {
-                log("Insets: window is null");
-                return;
-            }
+            if (window == null) return;
             View decor = window.getDecorView();
-            if (decor == null) {
-                log("Insets: decor is null");
-                return;
-            }
+            if (decor == null) return;
             WindowInsets insets = decor.getRootWindowInsets();
-            if (insets == null) {
-                log("Insets: rootWindowInsets is null");
-                return;
-            }
+            if (insets == null) return;
             log("Insets: sysBars=" + insets.getInsets(WindowInsets.Type.systemBars()).bottom
                     + ", navBars=" + insets.getInsets(WindowInsets.Type.navigationBars()).bottom
                     + ", captionBar=" + insets.getInsets(WindowInsets.Type.captionBar()).bottom
                     + ", ime=" + insets.getInsets(WindowInsets.Type.ime()).bottom
-                    + ", statusBars=" + insets.getInsets(WindowInsets.Type.statusBars()).bottom
                     + ", mandatorySys=" + insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom
                     + ", tappableElement=" + insets.getInsets(WindowInsets.Type.tappableElement()).bottom);
         } catch (Throwable t) {
             log("dumpWindowInsets failed: " + t);
+        }
+    }
+
+    private void hideCaptionBar(InputMethodService svc) {
+        try {
+            Window window = svc.getWindow().getWindow();
+            if (window == null) return;
+            View decor = window.getDecorView();
+            if (decor == null) return;
+
+            try {
+                android.view.WindowInsetsController ctrl =
+                        decor.getWindowInsetsController();
+                if (ctrl != null) {
+                    ctrl.hide(WindowInsets.Type.captionBar());
+                    log("hide captionBar requested");
+                } else {
+                    log("hide captionBar: controller is null");
+                }
+            } catch (Throwable t) {
+                log("hide captionBar failed: " + t);
+            }
+
+            try {
+                decor.requestApplyInsets();
+            } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            log("hideCaptionBar outer failed: " + t);
         }
     }
 
@@ -271,6 +289,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             InputMethodService svc = (InputMethodService) param.thisObject;
+                            hideCaptionBar(svc);
                             dumpWindowInsets(svc);
                         }
                     });
