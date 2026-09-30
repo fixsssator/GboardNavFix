@@ -67,8 +67,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
      */
     private static final boolean USE_DYNAMIC_STRETCH = true;
 
-    /** Вырезать captionBar/tappable/mandatory-gestures инсеты у InputView. */
-    private static final boolean STRIP_INSETS_FOR_INPUT_VIEW = true;
+    /**
+     * Вырезать captionBar/tappable/mandatory-gestures инсеты у InputView.
+     * По логам это НЕ убирает padding 99 (он приходит откуда-то выше по иерархии),
+     * а Gboard может по этим инсетам решать, показывать ли глобус, поэтому выключено.
+     */
+    private static final boolean STRIP_INSETS_FOR_INPUT_VIEW = false;
 
     /** Порог скачка высоты ребёнка InputView, после которого пишем дерево вью. */
     private static final int JUMP_DUMP_THRESHOLD_PX = 50;
@@ -170,6 +174,17 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         if (cd == null) return false;
         String s = cd.toString().toLowerCase();
         return s.contains("language") || s.contains("язык");
+    }
+
+    /**
+     * Клавишу смены языка (глобус) прячем и блокируем ТОЛЬКО когда спуф выключен.
+     * При SPOOF_VERSION_TO_DISABLE_EXPERIMENT = true она должна оставаться видимой и кликабельной
+     * (раньше setVisibility/performClick прятали её всегда, хотя в логе писалось «real language key visible»).
+     */
+    private static boolean shouldSuppressLanguageKey(View v, String idName) {
+        return !SPOOF_VERSION_TO_DISABLE_EXPERIMENT
+                && LANGUAGE_KEY_ID.equals(idName)
+                && isLanguageCd(v.getContentDescription());
     }
 
     private static boolean isNavBarFrame(View v) {
@@ -608,8 +623,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 String idName = resName(v);
                 if (isAlwaysHidden(idName)) {
                     param.args[0] = View.GONE;
-                } else if (LANGUAGE_KEY_ID.equals(idName)
-                        && isLanguageCd(v.getContentDescription())) {
+                } else if (shouldSuppressLanguageKey(v, idName)) {
                     param.args[0] = View.GONE;
                 }
             }
@@ -623,8 +637,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                 String idName = resName(v);
                 if (isAlwaysHidden(idName)) {
                     param.setResult(false);
-                } else if (LANGUAGE_KEY_ID.equals(idName)
-                        && isLanguageCd(v.getContentDescription())) {
+                } else if (shouldSuppressLanguageKey(v, idName)) {
                     param.setResult(false);
                 }
             }
