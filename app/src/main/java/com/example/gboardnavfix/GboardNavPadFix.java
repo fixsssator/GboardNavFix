@@ -2,6 +2,7 @@ package com.example.gboardnavfix;
 
 import android.content.res.Configuration;
 import android.content.res.Resources;
+import android.graphics.Insets;
 import android.graphics.drawable.Drawable;
 import android.inputmethodservice.InputMethodService;
 import android.util.Log;
@@ -34,11 +35,17 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Убирает пустую полосу под клавиатурой Gboard на Pixel (gesture nav).
  *
  *   1. InputView.onMeasure → setMeasuredDimension(w, mh + extra)
- *   2. FrameLayout (ребёнок InputView).onMeasure → setMeasuredDimension(w, mh + extra)
- *   3. Скрытие captionBar через WindowInsetsController (Android 13+).
- *   4. Пост-проверки (один набор на View) догоняют правильную высоту.
+ *   2. FrameLayout (ребёнок InputView).onMeasure → setMeasuredDimension(w, mh + extra),
+ *      перед этим обнуляется его нижний padding (Gboard сам подмешивает туда инсет).
+ *   3. Инсеты captionBar / tappableElement / mandatorySystemGestures вырезаются
+ *      на входе в InputView, чтобы Gboard не добавлял свои ~99px внутрь раскладки.
+ *   4. Скрытие captionBar через WindowInsetsController (Android 13+).
+ *   5. Пост-проверки (один набор на View) догоняют правильную высоту.
+ *   6. Диагностика: при скачке высоты ребёнка InputView (> 50px) в лог пишется
+ *      дерево вью (высота, padB, marB, visibility) — по нему видно, откуда лишние px.
  *
- * extra = высота навбара из insets (кэш по ориентации), запасной вариант STRETCH_PX.
+ * extra = max(captionBar, navigationBars) из insets (кэш по ориентации),
+ * запасной вариант — системный dimen, затем STRETCH_PX.
  */
 public class GboardNavPadFix implements IXposedHookLoadPackage {
 
@@ -55,11 +62,16 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final int STRETCH_PX = 99;
 
     /**
-     * true  — брать высоту навбара из insets / системного dimen (в лог пишется реальное значение).
-     * false — всегда STRETCH_PX (старое поведение). Если реальное значение в логе != 99 и
-     *         вид стал хуже — поставь false.
+     * true  — брать высоту из insets / системного dimen (реальное значение пишется в лог).
+     * false — всегда STRETCH_PX (старое поведение).
      */
     private static final boolean USE_DYNAMIC_STRETCH = true;
+
+    /** Вырезать captionBar/tappable/mandatory-gestures инсеты у InputView. */
+    private static final boolean STRIP_INSETS_FOR_INPUT_VIEW = true;
+
+    /** Порог скачка высоты ребёнка InputView, после которого пишем дерево вью. */
+    private static final int JUMP_DUMP_THRESHOLD_PX = 50;
 
     private static final int[] FIX_DELAYS = {0, 100, 300, 700, 1500};
 
@@ -84,8 +96,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static final boolean ADD_CUSTOM_GLOBE_BUTTON = false;
     /** Логи измерений (пишутся только при изменении значений). */
     private static final boolean DEBUG_DUMP = true;
-    /** Чистить phenotype-кэш только при первом запуске, а не при каждом старте процесса. */
-    private static final boolean WIPE_PHENOTYPE_ONLY_ONCE = true;
+    /**
+     * true  — чистить phenotype-кэш только при первом запуске.
+     * false — чистить при каждом старте процесса (как в старой сборке).
+     * Пока ищем причину «клавиатура снова поднимается» — false.
+     */
+    private static final boolean WIPE_PHENOTYPE_ONLY_ONCE = false;
 
     private static final String[] PHENOTYPE_CACHE_PATHS = {
             "files/phenotype",
@@ -115,6 +131,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     // Для логов «только при изменении»
     private static volatile int sLastInputViewH = -1;
     private static volatile int sLastChildH = -1;
+    private static volatile int sLastChildMh = -1;
     private static volatile String sLastLayoutSig = "";
 
     private static Method sSetMeasured;
@@ -161,6 +178,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static boolean isInputView(View v) {
         return v != null && TARGET_VIEW_CLASS.equals(v.getClass().getName());
+    }
+
+    /** true, если v — прямой ребёнок InputView. */
+    private static boolean isInputViewChild(View v) {
+        ViewParent parent = v.getParent();
+        return parent instanceof View && isInputView((View) parent);
     }
 
     private static void callSetMeasuredDimension(View v, int w, int h) {
@@ -210,14 +233,22 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         int cached = sNavCache[idx];
         if (cached > 0) return cached;
 
-        int fromInsets = 0;
+        int caption = 0;
+        int navBars = 0;
         try {
             WindowInsets ins = v.getRootWindowInsets();
             if (ins != null) {
-                fromInsets = ins.getInsetsIgnoringVisibility(
-                        WindowInsets.Type.navigationBars()).bottom;
+                try {
+                    caption = ins.getInsetsIgnoringVisibility(
+                            WindowInsets.Type.captionBar()).bottom;
+                } catch (Throwable ignored) {}
+                try {
+                    navBars = ins.getInsetsIgnoringVisibility(
+                            WindowInsets.Type.navigationBars()).bottom;
+                } catch (Throwable ignored) {}
             }
         } catch (Throwable ignored) {}
+        int fromInsets = Math.max(caption, navBars);
 
         int fromDimen = 0;
         try {
@@ -232,7 +263,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
         if (fromInsets > 0) {
             sNavCache[idx] = fromInsets;
-            log("nav stretch px=" + fromInsets + " (insets), systemDimen=" + fromDimen
+            log("nav stretch px=" + fromInsets + " (insets: caption=" + caption
+                    + ", navBars=" + navBars + "), systemDimen=" + fromDimen
                     + ", const=" + STRETCH_PX + ", orientation=" + (idx == 1 ? "land" : "port"));
             return fromInsets;
         }
@@ -280,6 +312,26 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     if (delay == last) FIX_PENDING.remove(v);
                 }
             }, delay);
+        }
+    }
+
+    /** Дерево вью для поиска источника лишних пикселей. */
+    private static void dumpTree(View v, int depth, StringBuilder sb) {
+        for (int i = 0; i < depth; i++) sb.append("  ");
+        ViewGroup.LayoutParams lp = v.getLayoutParams();
+        sb.append(v.getClass().getSimpleName())
+                .append(" id=").append(resName(v))
+                .append(" h=").append(v.getMeasuredHeight())
+                .append(" padB=").append(v.getPaddingBottom());
+        if (lp instanceof ViewGroup.MarginLayoutParams) {
+            sb.append(" marB=").append(((ViewGroup.MarginLayoutParams) lp).bottomMargin);
+        }
+        sb.append(" vis=").append(v.getVisibility()).append('\n');
+        if (v instanceof ViewGroup && depth < 4) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                dumpTree(g.getChildAt(i), depth + 1, sb);
+            }
         }
     }
 
@@ -415,6 +467,28 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             }
         }, View.class);
 
+        // ============ Вырезаем инсеты у InputView ============
+        if (STRIP_INSETS_FOR_INPUT_VIEW) {
+            tryHookClass(View.class, "dispatchApplyWindowInsets", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    View v = (View) param.thisObject;
+                    if (!isInputView(v)) return;
+                    try {
+                        WindowInsets in = (WindowInsets) param.args[0];
+                        if (in == null) return;
+                        param.args[0] = new WindowInsets.Builder(in)
+                                .setInsets(WindowInsets.Type.captionBar(), Insets.NONE)
+                                .setInsets(WindowInsets.Type.tappableElement(), Insets.NONE)
+                                .setInsets(WindowInsets.Type.mandatorySystemGestures(), Insets.NONE)
+                                .build();
+                    } catch (Throwable t) {
+                        log("insets strip failed: " + t);
+                    }
+                }
+            }, WindowInsets.class);
+        }
+
         // ============ Иконка языка ============
         tryHook("android.inputmethodservice.navigationbar.KeyButtonView",
                 lpparam.classLoader, "setImageDrawable", new XC_MethodHook() {
@@ -450,6 +524,10 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                     param.args[3] = 0;
                 } else if (isNavBarFrame(v)) {
                     param.args[3] = 0;
+                } else if (isInputViewChild(v)) {
+                    log("zeroing InputView child bottom padding, was=" + bottom
+                            + " (" + v.getClass().getSimpleName() + ")");
+                    param.args[3] = 0;
                 }
             }
         }, int.class, int.class, int.class, int.class);
@@ -458,7 +536,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 View v = (View) param.thisObject;
-                if ((int) param.args[3] > 0 && isInputView(v)) {
+                if ((int) param.args[3] > 0 && (isInputView(v) || isInputViewChild(v))) {
                     param.args[3] = 0;
                 }
             }
@@ -621,28 +699,50 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         }
 
         // ============================================================
-        // FrameLayout (ребёнок InputView).onMeasure — растягиваем
+        // FrameLayout (ребёнок InputView).onMeasure — обнуляем padB, растягиваем
         // ============================================================
         try {
             XposedHelpers.findAndHookMethod(FrameLayout.class, "onMeasure",
                     int.class, int.class, new XC_MethodHook() {
                         @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            View v = (View) param.thisObject;
+                            if (!isInputViewChild(v)) return;
+                            int padB = v.getPaddingBottom();
+                            if (padB > 0) {
+                                log("child onMeasure: zeroing bottom padding, was=" + padB);
+                                v.setPadding(v.getPaddingLeft(), v.getPaddingTop(),
+                                        v.getPaddingRight(), 0);
+                            }
+                        }
+
+                        @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             View v = (View) param.thisObject;
-
-                            ViewParent parent = v.getParent();
-                            if (!(parent instanceof View)) return;
-                            if (!isInputView((View) parent)) return;
+                            if (!isInputViewChild(v)) return;
 
                             int mh = v.getMeasuredHeight();
                             if (mh <= 0) return;
 
                             int newH = mh + navBarPx(v);
 
-                            if (DEBUG_DUMP && newH != sLastChildH) {
-                                sLastChildH = newH;
-                                log("FrameLayout(InputView child).onMeasure: mh=" + mh
-                                        + " → stretch to " + newH);
+                            if (DEBUG_DUMP) {
+                                int prevMh = sLastChildMh;
+                                if (prevMh > 0
+                                        && Math.abs(mh - prevMh) > JUMP_DUMP_THRESHOLD_PX) {
+                                    StringBuilder sb = new StringBuilder();
+                                    sb.append("child jump mh ").append(prevMh)
+                                            .append(" → ").append(mh).append('\n');
+                                    dumpTree(v, 0, sb);
+                                    log(sb.toString());
+                                }
+                                sLastChildMh = mh;
+
+                                if (newH != sLastChildH) {
+                                    sLastChildH = newH;
+                                    log("FrameLayout(InputView child).onMeasure: mh=" + mh
+                                            + " → stretch to " + newH);
+                                }
                             }
 
                             callSetMeasuredDimension(v, v.getMeasuredWidth(), newH);
