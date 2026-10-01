@@ -342,7 +342,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             sb.append(" marB=").append(((ViewGroup.MarginLayoutParams) lp).bottomMargin);
         }
         sb.append(" vis=").append(v.getVisibility()).append('\n');
-        if (v instanceof ViewGroup && depth < 4) {
+        if (v instanceof ViewGroup && depth < 6) {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) {
                 dumpTree(g.getChildAt(i), depth + 1, sb);
@@ -744,10 +744,12 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                 if (prevMh > 0
                                         && Math.abs(mh - prevMh) > JUMP_DUMP_THRESHOLD_PX) {
                                     StringBuilder sb = new StringBuilder();
-                                    sb.append("child jump mh ").append(prevMh)
-                                            .append(" → ").append(mh).append('\n');
                                     dumpTree(v, 0, sb);
-                                    log(sb.toString());
+                                    long upSec = (android.os.SystemClock.uptimeMillis()
+                                            - android.os.Process.getStartUptimeMillis()) / 1000;
+                                    log("TREE child jump mh " + prevMh + " → " + mh
+                                            + " (t+" + upSec + "s since process start)");
+                                    logLines("TREE", sb.toString());
                                 }
                                 sLastChildMh = mh;
 
@@ -790,7 +792,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                                         .append(", children=").append(vg.getChildCount());
                                 for (int i = 0; i < vg.getChildCount(); i++) {
                                     View child = vg.getChildAt(i);
-                                    sb.append("\n  child[").append(i).append("] ")
+                                    sb.append(" | child[").append(i).append("] ")
                                             .append(child.getClass().getSimpleName())
                                             .append(" top=").append(child.getTop())
                                             .append(" bottom=").append(child.getBottom())
@@ -819,6 +821,9 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         try {
             if (WIPE_PHENOTYPE_ONLY_ONCE && marker.exists()) return;
         } catch (Throwable ignored) {}
+
+        logDir(base + "files");
+        logDir(base + "files/datastore");
 
         for (String rel : PHENOTYPE_CACHE_PATHS) {
             try {
@@ -1022,5 +1027,25 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
     private static void log(String msg) {
         XposedBridge.log(TAG + ": " + msg);
+    }
+
+    /** Каждая строка — отдельная запись в логе (иначе logcat сворачивает «N more lines»). */
+    private static void logLines(String prefix, String text) {
+        String[] lines = text.split("\n");
+        int max = Math.min(lines.length, 150);
+        for (int i = 0; i < max; i++) {
+            if (!lines[i].isEmpty()) log(prefix + " " + lines[i]);
+        }
+        if (lines.length > max) log(prefix + " ... +" + (lines.length - max) + " lines");
+    }
+
+    private static void logDir(String path) {
+        try {
+            File d = new File(path);
+            String[] names = d.list();
+            log("dir " + path + ": " + (names == null ? "null" : Arrays.toString(names)));
+        } catch (Throwable t) {
+            log("logDir failed for " + path + ": " + t);
+        }
     }
 }
