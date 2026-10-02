@@ -74,6 +74,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
      */
     private static final boolean STRIP_INSETS_FOR_INPUT_VIEW = false;
 
+    /**
+     * Обнулять пустой FrameLayout внизу раскладки Gboard (последний ребёнок вертикального
+     * LinearLayout внутри ребёнка InputView). По логам в «плохом» состоянии он имеет высоту 43px
+     * (или 142 = 43 + 99 на первом проходе), в нормальном — 0; именно он поднимает клавиатуру.
+     */
+    private static final boolean ZERO_BOTTOM_SPACER = true;
+
     /** Порог скачка высоты ребёнка InputView, после которого пишем дерево вью. */
     private static final int JUMP_DUMP_THRESHOLD_PX = 50;
 
@@ -137,6 +144,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static volatile int sLastChildH = -1;
     private static volatile int sLastChildMh = -1;
     private static volatile String sLastLayoutSig = "";
+    private static volatile int sLastSpacerH = -1;
 
     private static Method sSetMeasured;
 
@@ -199,6 +207,21 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     private static boolean isInputViewChild(View v) {
         ViewParent parent = v.getParent();
         return parent instanceof View && isInputView((View) parent);
+    }
+
+    /**
+     * Пустой FrameLayout внизу: parent = голый LinearLayout, v — его последний ребёнок,
+     * а LinearLayout — прямой ребёнок ребёнка InputView.
+     */
+    private static boolean isBottomSpacer(View v) {
+        if (v.getClass() != FrameLayout.class) return false;
+        if (((ViewGroup) v).getChildCount() != 0) return false;
+        ViewParent p = v.getParent();
+        if (p == null || p.getClass() != android.widget.LinearLayout.class) return false;
+        ViewGroup lin = (ViewGroup) p;
+        if (lin.getChildCount() < 2 || lin.getChildAt(lin.getChildCount() - 1) != v) return false;
+        ViewParent gp = lin.getParent();
+        return gp instanceof View && isInputViewChild((View) gp);
     }
 
     private static void callSetMeasuredDimension(View v, int w, int h) {
@@ -337,16 +360,51 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
         sb.append(v.getClass().getSimpleName())
                 .append(" id=").append(resName(v))
                 .append(" h=").append(v.getMeasuredHeight())
-                .append(" padB=").append(v.getPaddingBottom());
+                .append(" padB=").append(v.getPaddingBottom())
+                .append(" minH=").append(v.getMinimumHeight());
+        if (lp != null) {
+            sb.append(" lpH=").append(lp.height);
+        }
         if (lp instanceof ViewGroup.MarginLayoutParams) {
             sb.append(" marB=").append(((ViewGroup.MarginLayoutParams) lp).bottomMargin);
         }
         sb.append(" vis=").append(v.getVisibility()).append('\n');
-        if (v instanceof ViewGroup && depth < 6) {
+        if (v instanceof ViewGroup && depth < 8) {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) {
                 dumpTree(g.getChildAt(i), depth + 1, sb);
             }
+        }
+    }
+
+    /** Окружение при старте IME: по нему сравним «хороший» и «плохой» запуски (масштаб 446 vs 498). */
+    private void dumpEnv(InputMethodService svc) {
+        try {
+            Resources r = svc.getResources();
+            Configuration c = r.getConfiguration();
+            android.util.DisplayMetrics dm = r.getDisplayMetrics();
+            log("ENV density=" + dm.density + " dpi=" + c.densityDpi + " fontScale=" + c.fontScale
+                    + " screenDp=" + c.screenWidthDp + "x" + c.screenHeightDp
+                    + " smallestDp=" + c.smallestScreenWidthDp
+                    + " px=" + dm.widthPixels + "x" + dm.heightPixels
+                    + " orientation=" + c.orientation);
+        } catch (Throwable t) {
+            log("dumpEnv config failed: " + t);
+        }
+        try {
+            android.content.SharedPreferences sp =
+                    android.preference.PreferenceManager.getDefaultSharedPreferences(svc);
+            for (java.util.Map.Entry<String, ?> e : sp.getAll().entrySet()) {
+                String k = e.getKey().toLowerCase();
+                if (k.contains("height") || k.contains("scale") || k.contains("ratio")
+                        || k.contains("padding") || k.contains("bottom") || k.contains("one_hand")
+                        || k.contains("size") || k.contains("number_row") || k.contains("nav")
+                        || k.contains("inset") || k.contains("layout")) {
+                    log("ENV pref " + e.getKey() + "=" + e.getValue());
+                }
+            }
+        } catch (Throwable t) {
+            log("dumpEnv prefs failed: " + t);
         }
     }
 
@@ -407,7 +465,13 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
         log("hooking into Gboard, process=" + lpparam.processName);
 
-        wipePhenotypeCache();
+        // Не трогаем кэш из вспомогательных процессов (:train и т.п.) — иначе они
+        // стирают флаги, пока главный процесс клавиатуры работает.
+        if (GBOARD_PKG.equals(lpparam.processName)) {
+            wipePhenotypeCache();
+        } else {
+            log("skip phenotype wipe in secondary process " + lpparam.processName);
+        }
         installCrashGuard();
 
         // ============ Спуфинг версии/подписи ============
@@ -449,6 +513,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
             @Override
             protected void afterHookedMethod(MethodHookParam param) {
                 sImeService = (InputMethodService) param.thisObject;
+                dumpEnv(sImeService);
             }
         });
 
@@ -732,6 +797,20 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             View v = (View) param.thisObject;
+
+                            if (ZERO_BOTTOM_SPACER && v.getClass() == FrameLayout.class
+                                    && isBottomSpacer(v)) {
+                                int was = v.getMeasuredHeight();
+                                if (was > 0) {
+                                    if (was != sLastSpacerH) {
+                                        sLastSpacerH = was;
+                                        log("bottom spacer: " + was + " → 0");
+                                    }
+                                    callSetMeasuredDimension(v, v.getMeasuredWidth(), 0);
+                                }
+                                return;
+                            }
+
                             if (!isInputViewChild(v)) return;
 
                             int mh = v.getMeasuredHeight();
@@ -741,8 +820,8 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
 
                             if (DEBUG_DUMP) {
                                 int prevMh = sLastChildMh;
-                                if (prevMh > 0
-                                        && Math.abs(mh - prevMh) > JUMP_DUMP_THRESHOLD_PX) {
+                                if (prevMh <= 0
+                                        || Math.abs(mh - prevMh) > JUMP_DUMP_THRESHOLD_PX) {
                                     StringBuilder sb = new StringBuilder();
                                     dumpTree(v, 0, sb);
                                     long upSec = (android.os.SystemClock.uptimeMillis()
@@ -1032,7 +1111,7 @@ public class GboardNavPadFix implements IXposedHookLoadPackage {
     /** Каждая строка — отдельная запись в логе (иначе logcat сворачивает «N more lines»). */
     private static void logLines(String prefix, String text) {
         String[] lines = text.split("\n");
-        int max = Math.min(lines.length, 150);
+        int max = Math.min(lines.length, 250);
         for (int i = 0; i < max; i++) {
             if (!lines[i].isEmpty()) log(prefix + " " + lines[i]);
         }
